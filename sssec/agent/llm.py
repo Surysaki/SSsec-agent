@@ -44,6 +44,87 @@ def _is_local_base(base_url: str) -> bool:
         return False
 
 
+def _supports_reasoning_passthrough(provider: ProviderConfig) -> bool:
+    """判断服务是否使用 DeepSeek 风格的 reasoning_content。"""
+    text = f"{provider.model} {provider.base_url}".lower()
+    return "deepseek" in text
+
+
+class ReasoningChatOpenAI(ChatOpenAI):
+    """保留 DeepSeek 等 thinking 模型的非标准 ``reasoning_content``。
+
+    langchain-openai 默认只处理官方 OpenAI 字段，会丢弃 ``reasoning_content``；
+    但 DeepSeek thinking 模式要求下一轮把上一轮的 reasoning_content 原样带回。
+    这里做两件事：
+
+    1. 从 SSE delta 中提取 ``reasoning_content`` 放进 ``additional_kwargs``；
+    2. 构造请求时把 assistant 消息的 ``reasoning_content`` 写回 API 消息。
+
+    ``reasoning_passthrough`` 只在确认服务支持时开启，避免把 DeepSeek 的
+    历史字段发给官方 OpenAI 端点。
+    """
+
+    reasoning_passthrough: bool = False
+
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict,
+        default_chunk_class: Any,
+        base_generation_info: dict | None,
+    ) -> ChatGenerationChunk | None:
+        generation = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if generation is None:
+            return None
+        choices = (
+            chunk.get("choices")
+            or chunk.get("chunk", {}).get("choices")
+            or []
+        )
+        if choices:
+            delta = choices[0].get("delta") or {}
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                generation.message.additional_kwargs["reasoning_content"] = reasoning
+        return generation
+
+    def _get_request_payload(
+        self,
+        input_: Any,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if not self.reasoning_passthrough:
+            return payload
+        api_messages = payload.get("messages")
+        if not isinstance(api_messages, list):
+            return payload
+        try:
+            messages = self._convert_input(input_).to_messages()
+        except Exception:
+            return payload
+        for message, api_message in zip(messages, api_messages):
+            if not isinstance(message, AIMessage) or not isinstance(api_message, dict):
+                continue
+            reasoning = (
+                message.additional_kwargs.get("reasoning_content")
+                if isinstance(message.additional_kwargs, dict)
+                else None
+            )
+            if isinstance(reasoning, str) and reasoning:
+                api_message["reasoning_content"] = reasoning
+            elif message.content or message.tool_calls:
+                # 旧会话（本版本之前）没有保存 reasoning_content；DeepSeek
+                # thinking 模式要求该字段存在，用一个非空占位符兜底。
+                api_message["reasoning_content"] = (
+                    "（该轮历史未保存 reasoning_content，仅用于兼容 API 回传要求）"
+                )
+        return payload
+
+
 def validate_provider(provider: ProviderConfig) -> None:
     if provider.type == "demo":
         return
@@ -96,12 +177,13 @@ def build_chat_model(
             "timeout": httpx.Timeout(timeout_seconds),
             "max_retries": 2,
             "streaming": streaming,
+            "reasoning_passthrough": _supports_reasoning_passthrough(provider),
         }
         if base_url:
             kwargs["base_url"] = base_url
         if provider.max_tokens > 0:
             kwargs["max_tokens"] = provider.max_tokens
-        return ChatOpenAI(**kwargs)
+        return ReasoningChatOpenAI(**kwargs)
 
     kwargs = {
         "model": provider.model.strip(),
@@ -279,15 +361,14 @@ class DemoChatModel(BaseChatModel):
 
 {scope_line}
 
-接入真实模型后，我可以调用以下工具：
+接入真实模型后，SSsec 会由**指挥官**调度四个阶段子 Agent：
 
-| 工具 | 用途 | 审批 |
+| 阶段 | 主要工具 | 产出 |
 | --- | --- | --- |
-| `http_request` | 发起 HTTP 探测 | 标准模式自动执行（写请求需确认） |
-| `dns_lookup` | 查询 A / AAAA / MX / TXT 等记录 | 自动执行 |
-| `tcp_probe` | 对目标做有限 TCP 连通性检查 | 自动执行 |
-| `run_command` | 在会话工作目录执行 PowerShell | 标准模式逐条批准；完全权限直接执行 |
-| `save_finding` | 记录漏洞发现与证据 | 自动记录 |
+| 信息收集 | `http_request`、`dns_lookup`、`tcp_probe`、`whois_lookup`、`tls_certificate` | 资产清单、候选入口 |
+| 漏洞分析 | `security_headers`、`http_request`、`dns_lookup` | 漏洞假设、风险排序 |
+| 漏洞利用 | `http_request`、`run_command`、`encode_payload` | 验证证据、影响评估 |
+| 后渗透 | `run_command`、`workspace_list/read/write` | 权限/影响、证据整理 |
 
 **下一步**：点击左下角「设置」→「模型服务」，填入 OpenAI 兼容或 Anthropic 模型服务的信息，然后保存并设为当前模型即可。需要减少确认步骤时，可在对话顶部开启「完全权限」。
 
@@ -357,6 +438,7 @@ async def test_provider(provider: ProviderConfig, safety: SafetySettings) -> dic
 __all__ = [
     "DemoChatModel",
     "ModelConfigError",
+    "ReasoningChatOpenAI",
     "aclose_model",
     "build_chat_model",
     "extract_text",

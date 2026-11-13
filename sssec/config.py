@@ -18,7 +18,7 @@ from sssec.security.secrets import (
     unprotect_secret,
 )
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 CONFIG_SCHEMA = 2
 
 PROVIDER_TYPES = {
@@ -28,7 +28,8 @@ PROVIDER_TYPES = {
 }
 
 APPROVAL_MODES = {
-    "sensitive": "仅敏感工具需审批（默认）",
+    "relaxed": "宽松（仅高风险命令需确认，默认）",
+    "sensitive": "仅敏感工具需审批",
     "all": "所有工具均需审批",
     "off": "关闭审批（所有工具直接执行）",
     "full": "完全权限（免确认 + 取消范围拦截）",
@@ -155,13 +156,13 @@ def default_providers() -> list[ProviderConfig]:
 
 @dataclass
 class SafetySettings:
-    approval_mode: str = "sensitive"
+    approval_mode: str = "relaxed"
     scope_mode: str = "off"
     enable_shell: bool = True
-    max_tool_rounds: int = 8
+    max_tool_rounds: int = 12
     command_timeout: int = 60
     network_timeout: int = 20
-    max_history_messages: int = 40
+    max_history_messages: int = 60
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -169,9 +170,9 @@ class SafetySettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SafetySettings":
         data = data or {}
-        approval_mode = str(data.get("approval_mode", "sensitive"))
+        approval_mode = str(data.get("approval_mode", "relaxed"))
         if approval_mode not in APPROVAL_MODES:
-            approval_mode = "sensitive"
+            approval_mode = "relaxed"
         scope_mode = str(data.get("scope_mode", "off"))
         if scope_mode not in SCOPE_MODES:
             scope_mode = "off"
@@ -179,11 +180,11 @@ class SafetySettings:
             approval_mode=approval_mode,
             scope_mode=scope_mode,
             enable_shell=bool(data.get("enable_shell", True)),
-            max_tool_rounds=max(1, min(20, int(data.get("max_tool_rounds", 8) or 8))),
+            max_tool_rounds=max(1, min(20, int(data.get("max_tool_rounds", 12) or 12))),
             command_timeout=max(5, min(600, int(data.get("command_timeout", 60) or 60))),
             network_timeout=max(3, min(120, int(data.get("network_timeout", 20) or 20))),
             max_history_messages=max(
-                4, min(120, int(data.get("max_history_messages", 40) or 40))
+                4, min(120, int(data.get("max_history_messages", 60) or 60))
             ),
         )
 

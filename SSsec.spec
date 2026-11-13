@@ -26,6 +26,9 @@ for package in (
     "dns",
     "markdown",
     "tiktoken_ext",
+    "capstone",
+    "pefile",
+    "elftools",
 ):
     try:
         hiddenimports += collect_submodules(package)

@@ -6,6 +6,7 @@ import asyncio
 import copy
 import logging
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from sssec.agent.graph import compile_agent
 from sssec.agent.llm import aclose_model, friendly_error
 from sssec.agent.prompts import build_system_prompt
 from sssec.agent.runtime import AgentContext, AgentEvents
+from sssec.agent.stream import sanitize_messages
 from sssec.config import AppSettings, ProviderConfig
 from sssec.security.audit import AuditLog
 
@@ -26,6 +28,7 @@ logger = logging.getLogger("sssec.agent")
 class AgentWorker(QThread):
     text_delta = Signal(str)
     reasoning_delta = Signal(str)
+    commander_delta = Signal(str)
     tool_started = Signal(dict)
     tool_finished = Signal(dict)
     approval_required = Signal(dict)
@@ -168,6 +171,7 @@ class AgentWorker(QThread):
             events=AgentEvents(
                 text_delta=self.text_delta.emit,
                 reasoning_delta=self.reasoning_delta.emit,
+                commander_delta=self.commander_delta.emit,
                 tool_started=self.tool_started.emit,
                 tool_finished=self.tool_finished.emit,
                 finding_saved=self.finding_saved.emit,
@@ -186,6 +190,7 @@ class AgentWorker(QThread):
         )
         audit.write(
             "run_start",
+            architecture="supervisor+subgraph",
             provider=self.provider.name,
             model=self.provider.model,
             scope=self.scope,
@@ -201,10 +206,23 @@ class AgentWorker(QThread):
                 self._model = ctx.model
             config = {
                 "configurable": {"thread_id": f"run-{self.conversation_id}-{id(self)}"},
-                "recursion_limit": max(10, self.settings.safety.max_tool_rounds * 3 + 4),
+                # 多 Agent 图的超步数明显多于单 Agent；按每个子 Agent 的
+                # 工具轮次留足空间，同时由 PentestState.step 做阶段上限。
+                "recursion_limit": max(
+                    160,
+                    min(400, self.settings.safety.max_tool_rounds * 24 + 60),
+                ),
             }
             next_input: Any = {
-                "messages": [*self.history, HumanMessage(content=self.user_input)]
+                "messages": sanitize_messages(
+                    [
+                        *self.history,
+                        HumanMessage(
+                            content=self.user_input,
+                            id=f"human_{uuid.uuid4().hex}",
+                        ),
+                    ]
+                )
             }
             while True:
                 interrupted = False

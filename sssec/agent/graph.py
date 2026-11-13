@@ -1,70 +1,250 @@
-"""LangGraph Agent：流式模型节点、工具节点与人工审批中断。"""
+"""多 Agent 编排：指挥官 Supervisor + 四个渗透阶段子图。
+
+整体结构：
+
+    START → commander ──决定──→ recon / vuln_analysis / exploit / post_exploit
+                 ▲                              │
+                 └──────────── report ◄─────────┘
+                 │
+                 └── finish → finalize → END
+
+* 指挥官只做路由，不持有工具；
+* 每个阶段是一个独立编译的子图，拥有自己的工具集与提示词；
+* 子图的 ``interrupt()`` 会冒泡到父图，由 ``AgentWorker`` 统一向 UI 请求审批；
+* 子图结束后由父图 ``report`` 节点生成阶段报告，再交给指挥官决定下一步。
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
-import time
 import uuid
-from typing import Annotated, Any, TypedDict
+from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import (
-    AIMessage,
-    AnyMessage,
-    BaseMessage,
-    SystemMessage,
-    ToolMessage,
-)
-from langchain_core.messages import message_chunk_to_message
-from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
-from langgraph.types import interrupt
 
-from sssec.agent.llm import (
-    build_chat_model,
-    extract_reasoning,
-    extract_text,
-)
+from sssec.agent.commander import commander_node
+from sssec.agent.llm import DemoChatModel, build_chat_model, extract_text
+from sssec.agent.prompts import build_system_prompt
 from sssec.agent.runtime import AgentContext
-from sssec.agent.tools import _result_ok, build_tools, truncate_middle
+from sssec.agent.state import PentestState, WORKER_LABELS
+from sssec.agent.stream import sanitize_messages, stream_reply
+from sssec.agent.tools import build_tools
+from sssec.agent.workers import WORKER_SPECS, WorkerSpec, compile_worker
+from sssec.models import now_iso
+
+# 兼容旧导入名。
+AgentState = PentestState
 
 
-class AgentState(TypedDict, total=False):
-    messages: Annotated[list[AnyMessage], add_messages]
-    approval: dict[str, Any] | None
+def _ensure_system_prompt(ctx: AgentContext) -> None:
+    if (ctx.system_prompt or "").strip():
+        return
+    ctx.system_prompt = build_system_prompt(
+        scope=ctx.scope,
+        authorized=ctx.authorized,
+        settings=ctx.settings,
+        provider=ctx.provider,
+        findings=ctx.findings,
+        workspace=str(ctx.workspace),
+        full_permission=ctx.full_permission,
+    )
 
 
-APPROVAL_REASON = {
-    "run_command": "命令执行需要在操作员确认后运行",
-    "http_request": "网络探测请求需要操作员确认",
-    "dns_lookup": "DNS 查询需要操作员确认",
-    "tcp_probe": "端口探测需要操作员确认",
-    "save_finding": "写入测试发现需要操作员确认",
-}
+def _last_ai_text(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and not message.tool_calls:
+            text = extract_text(message.content).strip()
+            if text:
+                return text
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            text = extract_text(message.content).strip()
+            if text:
+                return text
+    return ""
 
 
-def _json_safe(value: Any) -> Any:
-    try:
-        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
-    except Exception:
-        return str(value)
+def _compile_demo(
+    ctx: AgentContext,
+    model: BaseChatModel,
+    checkpointer: BaseCheckpointSaver,
+):
+    """离线演示模型：保持单节点体验，不进入多 Agent 空转。"""
+
+    async def agent_node(state: PentestState) -> dict[str, Any]:
+        message = await stream_reply(
+            model,
+            [
+                SystemMessage(content=ctx.system_prompt),
+                *sanitize_messages(state.get("messages") or []),
+            ],
+            ctx,
+        )
+        return {"messages": [message]}
+
+    builder = StateGraph(PentestState)
+    builder.add_node("demo_agent", agent_node)
+    builder.add_edge(START, "demo_agent")
+    builder.add_edge("demo_agent", END)
+    return builder.compile(checkpointer=checkpointer)
 
 
-def _tool_call_payload(call: dict[str, Any], requires_approval: bool) -> dict[str, Any]:
-    return {
-        "id": str(call.get("id") or uuid.uuid4().hex),
-        "name": str(call.get("name") or "unknown_tool"),
-        "args": _json_safe(call.get("args") or {}),
-        "requires_approval": requires_approval,
+def _compile_solver(
+    ctx: AgentContext,
+    base_model: BaseChatModel,
+    checkpointer: BaseCheckpointSaver,
+    *,
+    final: bool = False,
+):
+    """单 Agent / 最终突破图：全部工具 + 任务级轮次，没有指挥官开销。"""
+    tool_names = tuple(tool.name for tool in build_tools(ctx))
+    configured = max(1, int(ctx.settings.safety.max_tool_rounds or 16))
+    max_rounds = max(configured, 20) if final else configured
+    name = "final" if final else "single"
+    spec = WorkerSpec(
+        name=name,
+        label=WORKER_LABELS.get(name, name),
+        tool_names=tool_names,
+        max_rounds=max_rounds,
+    )
+    ctx.audit.write(
+        "final_start" if final else "single_start",
+        tools=list(tool_names),
+        max_tool_rounds=max_rounds,
+    )
+    return compile_worker(
+        ctx,
+        spec,
+        base_model,
+        include_handoff=False,
+        checkpointer=checkpointer,
+    )
+
+
+def _compile_single(
+    ctx: AgentContext,
+    base_model: BaseChatModel,
+    checkpointer: BaseCheckpointSaver,
+):
+    return _compile_solver(ctx, base_model, checkpointer, final=False)
+
+
+def _compile_team(
+    ctx: AgentContext,
+    base_model: BaseChatModel,
+    checkpointer: BaseCheckpointSaver,
+):
+    worker_graphs = {
+        name: compile_worker(ctx, WORKER_SPECS[name], base_model)
+        for name in WORKER_SPECS
     }
 
+    async def commander(state: PentestState) -> dict[str, Any]:
+        return await commander_node(ctx, base_model, state)
 
-def _ensure_call_ids(message: AIMessage) -> None:
-    for index, call in enumerate(message.tool_calls or []):
-        if not call.get("id"):
-            call["id"] = f"call_{uuid.uuid4().hex[:16]}_{index}"
+    def report(state: PentestState) -> dict[str, Any]:
+        worker = str(state.get("next_agent") or "unknown")
+        label = WORKER_LABELS.get(worker, worker)
+        messages = state.get("messages") or []
+        summary = _last_ai_text(messages)
+        recent = [
+            {
+                "type": getattr(item, "type", type(item).__name__),
+                "content": extract_text(getattr(item, "content", ""))[:400],
+            }
+            for item in messages[-6:]
+        ]
+        evidence = [
+            {
+                "tool": str(getattr(item, "name", "tool") or "tool"),
+                "status": str(getattr(item, "status", "") or ""),
+                "content": extract_text(getattr(item, "content", ""))[:600],
+            }
+            for item in messages
+            if isinstance(item, ToolMessage)
+        ][-8:]
+        fingerprint = hashlib.sha1(
+            json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest() if evidence else hashlib.sha1(summary.encode("utf-8")).hexdigest()
+        entry = {
+            "worker": worker,
+            "label": label,
+            "task": str(state.get("task") or ""),
+            "summary": summary[-4000:],
+            "handoff": state.get("handoff"),
+            "recent": recent,
+            "evidence": evidence,
+            "progress_key": fingerprint,
+            "created_at": now_iso(),
+        }
+        ctx.audit.write(
+            "worker_report",
+            worker=worker,
+            task=entry["task"][:1500],
+            summary=entry["summary"][:2000],
+            handoff=entry["handoff"],
+            evidence_count=len(evidence),
+            progress_key=fingerprint,
+        )
+        return {"worker_reports": [*(state.get("worker_reports") or []), entry]}
+
+    def finalize(state: PentestState) -> dict[str, Any]:
+        summary = str(state.get("finish_summary") or "").strip()
+        if not summary:
+            summary = "已完成当前可执行的阶段，按现有证据收尾。"
+        text = f"\n\n---\n\n**指挥官收尾**：{summary}"
+        ctx.emit_text(text)
+        ctx.audit.write(
+            "team_finished",
+            steps=int(state.get("step") or 0),
+            summary=summary[:2000],
+            workers=[
+                str(item.get("worker") or "")
+                for item in (state.get("worker_reports") or [])
+            ],
+        )
+        return {
+            "messages": [AIMessage(content=text, id=f"ai_{uuid.uuid4().hex}")],
+            "finished": True,
+        }
+
+    def route_commander(state: PentestState) -> str:
+        target = str(state.get("next_agent") or "")
+        return target if target in worker_graphs else "finalize"
+
+    builder = StateGraph(PentestState)
+    builder.add_node("commander", commander)
+    for name, graph in worker_graphs.items():
+        builder.add_node(name, graph)
+    builder.add_node("report", report)
+    builder.add_node("finalize", finalize)
+
+    builder.add_edge(START, "commander")
+    builder.add_conditional_edges(
+        "commander",
+        route_commander,
+        {
+            **{name: name for name in worker_graphs},
+            "finalize": "finalize",
+        },
+    )
+    for name in worker_graphs:
+        builder.add_edge(name, "report")
+    builder.add_edge("report", "commander")
+    builder.add_edge("finalize", END)
+
+    ctx.audit.write(
+        "team_start",
+        workers=list(worker_graphs),
+        max_tool_rounds=ctx.settings.safety.max_tool_rounds,
+        approval_mode=ctx.settings.safety.approval_mode,
+    )
+    return builder.compile(checkpointer=checkpointer)
 
 
 def compile_agent(
@@ -72,219 +252,31 @@ def compile_agent(
     *,
     model: BaseChatModel | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    single: bool = False,
+    final: bool = False,
 ):
-    tools = build_tools(ctx)
-    tool_by_name = {item.name: item for item in tools}
+    """编译 SSsec Agent 图。
+
+    ``single=True`` 时走单 Agent 快速解题图（全部工具，任务级轮次）；
+    ``final=True`` 时走最终汇总突破图（全部工具、更高轮次、证据只作参考）；
+    默认仍走“指挥官 + 阶段子图”的多 Agent 图。
+    ``model`` 主要用于测试注入；生产路径使用当前 Provider 构建模型。
+    离线演示模型仍走单节点图，避免无工具能力的模型在四个阶段间空转。
+    """
+    _ensure_system_prompt(ctx)
     base_model = model or build_chat_model(
         ctx.provider, ctx.settings.safety, streaming=True
     )
     # 记录到上下文，Worker 在事件循环关闭前会显式关闭底层 HTTP 客户端。
     ctx.model = base_model
-    bound_model = base_model.bind_tools(tools)
-
-    async def agent_node(state: AgentState) -> dict[str, Any]:
-        messages: list[BaseMessage] = [
-            SystemMessage(content=ctx.system_prompt),
-            *state["messages"],
-        ]
-        aggregate = None
-        try:
-            async for chunk in bound_model.astream(messages):
-                if aggregate is None:
-                    aggregate = chunk
-                else:
-                    aggregate = aggregate + chunk
-                text = extract_text(getattr(chunk, "content", ""))
-                if text:
-                    ctx.emit_text(text)
-                reasoning = extract_reasoning(chunk)
-                if reasoning:
-                    ctx.emit_reasoning(reasoning)
-        except Exception:
-            raise
-        if aggregate is None:
-            raise RuntimeError("模型没有返回任何内容")
-        message = message_chunk_to_message(aggregate)
-        if not isinstance(message, AIMessage):
-            message = AIMessage(content=extract_text(getattr(message, "content", "")))
-        _ensure_call_ids(message)
-        return {"messages": [message]}
-
-    def route_after_agent(state: AgentState) -> str:
-        last = state["messages"][-1] if state.get("messages") else None
-        if not isinstance(last, AIMessage) or not last.tool_calls:
-            return END
-        if any(
-            ctx.requires_approval(
-                str(call.get("name") or ""),
-                call.get("args") if isinstance(call.get("args"), dict) else {},
-            )
-            for call in last.tool_calls
-        ):
-            return "approval"
-        return "tools"
-
-    def approval_node(state: AgentState) -> dict[str, Any]:
-        last = state["messages"][-1]
-        calls = [
-            _tool_call_payload(
-                call,
-                ctx.requires_approval(
-                    str(call.get("name") or ""),
-                    call.get("args") if isinstance(call.get("args"), dict) else {},
-                ),
-            )
-            for call in (last.tool_calls or [])
-        ]
-        payload = {
-            "type": "approval_required",
-            "calls": calls,
-            "reason": "本轮工具调用包含敏感操作，请核对后决定是否执行。",
-        }
-        decision = interrupt(payload)
-        if not isinstance(decision, dict):
-            decision = {"approved": bool(decision)}
-        return {"approval": decision}
-
-    async def tools_node(state: AgentState) -> dict[str, Any]:
-        last = state["messages"][-1]
-        approval = state.get("approval") or {}
-        approved = bool(approval.get("approved"))
-        calls = list(last.tool_calls or [])
-        gate_needed = any(
-            ctx.requires_approval(
-                str(call.get("name") or ""),
-                call.get("args") if isinstance(call.get("args"), dict) else {},
-            )
-            for call in calls
-        )
-        if gate_needed:
-            ctx.audit.write(
-                "approval_decision",
-                approved=approved,
-                calls=[
-                    {
-                        "name": call.get("name"),
-                        "args": call.get("args"),
-                        "id": call.get("id"),
-                    }
-                    for call in calls
-                ],
-            )
-        deny_all = gate_needed and not approved
-        tool_messages: list[ToolMessage] = []
-        for call in calls:
-            call_id = str(call.get("id") or uuid.uuid4().hex)
-            name = str(call.get("name") or "unknown_tool")
-            args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            requires = ctx.requires_approval(name, args)
-            started = time.perf_counter()
-            if deny_all:
-                denied = json.dumps(
-                    {
-                        "ok": False,
-                        "error": "操作员拒绝了本轮工具调用。请停止该操作，并向用户说明。",
-                        "denied": True,
-                    },
-                    ensure_ascii=False,
-                )
-                ctx.emit_tool_finished(call_id, name, "denied", denied, 0)
-                ctx.audit.write(
-                    "tool_denied",
-                    tool=name,
-                    args=args,
-                    call_id=call_id,
-                )
-                tool_messages.append(
-                    ToolMessage(
-                        content=denied,
-                        tool_call_id=call_id,
-                        name=name,
-                        status="error",
-                    )
-                )
-                continue
-
-            ctx.emit_tool_started(call_id, name, args, requires)
-            ctx.audit.write("tool_call", tool=name, args=args, call_id=call_id)
-            target_tool = tool_by_name.get(name)
-            if target_tool is None:
-                error = json.dumps(
-                    {"ok": False, "error": f"工具不可用或不存在：{name}"},
-                    ensure_ascii=False,
-                )
-                duration = int((time.perf_counter() - started) * 1000)
-                ctx.emit_tool_finished(call_id, name, "error", error, duration)
-                ctx.audit.write(
-                    "tool_result",
-                    tool=name,
-                    status="error",
-                    duration_ms=duration,
-                )
-                tool_messages.append(
-                    ToolMessage(
-                        content=error,
-                        tool_call_id=call_id,
-                        name=name,
-                        status="error",
-                    )
-                )
-                continue
-
-            ctx.command_approved = approved or not requires
-            try:
-                raw_result = await target_tool.ainvoke(args)
-                result = (
-                    raw_result
-                    if isinstance(raw_result, str)
-                    else json.dumps(raw_result, ensure_ascii=False, default=str)
-                )
-                result = truncate_middle(result)
-                status = "done" if _result_ok(result) else "error"
-            except Exception as exc:
-                result = json.dumps(
-                    {
-                        "ok": False,
-                        "error": f"{type(exc).__name__}: {str(exc)[:800]}",
-                    },
-                    ensure_ascii=False,
-                )
-                status = "error"
-            finally:
-                ctx.command_approved = False
-            duration = int((time.perf_counter() - started) * 1000)
-            ctx.emit_tool_finished(call_id, name, status, result, duration)
-            ctx.audit.write(
-                "tool_result",
-                tool=name,
-                call_id=call_id,
-                status=status,
-                duration_ms=duration,
-                result_preview=result[:1500],
-            )
-            tool_messages.append(
-                ToolMessage(
-                    content=result,
-                    tool_call_id=call_id,
-                    name=name,
-                    status="success" if status == "done" else "error",
-                )
-            )
-        return {"messages": tool_messages, "approval": None}
-
-    builder = StateGraph(AgentState)
-    builder.add_node("agent", agent_node)
-    builder.add_node("approval", approval_node)
-    builder.add_node("tools", tools_node)
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges(
-        "agent",
-        route_after_agent,
-        {"approval": "approval", "tools": "tools", END: END},
-    )
-    builder.add_edge("approval", "tools")
-    builder.add_edge("tools", "agent")
-    return builder.compile(checkpointer=checkpointer or InMemorySaver())
+    saver = checkpointer or InMemorySaver()
+    if isinstance(base_model, DemoChatModel):
+        return _compile_demo(ctx, base_model, saver)
+    if final:
+        return _compile_solver(ctx, base_model, saver, final=True)
+    if single:
+        return _compile_single(ctx, base_model, saver)
+    return _compile_team(ctx, base_model, saver)
 
 
 __all__ = ["AgentState", "compile_agent"]

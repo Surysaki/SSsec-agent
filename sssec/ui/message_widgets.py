@@ -35,17 +35,75 @@ from sssec.ui.widgets import (
 
 TOOL_LABELS = {
     "http_request": "HTTP 请求",
+    "http_probe": "HTTP 指纹",
+    "http_raw": "原始 HTTP",
+    "http_upload": "文件上传",
     "dns_lookup": "DNS 查询",
+    "dns_zone_transfer": "DNS 区域传送",
     "tcp_probe": "TCP 探测",
+    "tcp_exchange": "TCP 交互",
+    "port_scan": "端口扫描",
+    "subdomain_enum": "子域枚举",
+    "dir_scan": "目录发现",
+    "web_crawl": "页面爬取",
     "run_command": "命令执行",
     "save_finding": "记录发现",
+    "whois_lookup": "WHOIS 查询",
+    "tls_certificate": "TLS 证书",
+    "security_headers": "安全响应头",
+    "param_fuzz": "参数探测",
+    "cors_check": "CORS 检查",
+    "jwt_analyze": "JWT 分析",
+    "waf_detect": "WAF 识别",
+    "webshell_client": "Webshell",
+    "codec": "编解码",
+    "payload_forge": "Payload 生成",
+    "binary_info": "二进制分析",
+    "crypto_workshop": "Crypto 分析",
+    "file_analyze": "文件分析",
+    "archive_extract": "解压",
+    "artifact_scan": "源码/秘密扫描",
+    "flag_hunt": "Flag 提取",
+    "workspace_list": "目录浏览",
+    "workspace_read": "读取文件",
+    "workspace_write": "写入文件",
+    "handoff": "交接阶段",
 }
 TOOL_ICONS = {
     "http_request": "globe",
+    "http_probe": "globe",
+    "http_raw": "terminal",
+    "http_upload": "arrow_up_right",
     "dns_lookup": "search",
+    "dns_zone_transfer": "search",
     "tcp_probe": "shield_plain",
+    "tcp_exchange": "terminal",
+    "port_scan": "shield_plain",
+    "subdomain_enum": "search",
+    "dir_scan": "folder",
+    "web_crawl": "globe",
     "run_command": "terminal",
     "save_finding": "file",
+    "whois_lookup": "book",
+    "tls_certificate": "lock",
+    "security_headers": "shield",
+    "param_fuzz": "alert",
+    "cors_check": "globe",
+    "jwt_analyze": "key",
+    "waf_detect": "shield",
+    "webshell_client": "terminal",
+    "codec": "spark",
+    "payload_forge": "spark",
+    "binary_info": "file",
+    "crypto_workshop": "lock",
+    "file_analyze": "file",
+    "archive_extract": "folder",
+    "artifact_scan": "search",
+    "flag_hunt": "target",
+    "workspace_list": "folder",
+    "workspace_read": "file",
+    "workspace_write": "edit",
+    "handoff": "arrow_up_right",
 }
 STATUS_LABELS = {
     "pending": "等待",
@@ -95,6 +153,36 @@ def _preview_args(tool: dict[str, Any]) -> str:
         if name == "save_finding":
             severity = SEVERITIES.get(str(args.get("severity")), args.get("severity", ""))
             return f"{args.get('title', '')}  ·  {severity}"
+        if name == "whois_lookup":
+            return str(args.get("host", ""))
+        if name == "tls_certificate":
+            return f"{args.get('host', '')}:{args.get('port', 443)}"
+        if name == "security_headers":
+            return str(args.get("url", ""))
+        if name == "encode_payload":
+            return f"{args.get('encoding', 'base64')}  ·  {str(args.get('data', ''))[:80]}"
+        if name in ("workspace_list", "workspace_read", "workspace_write"):
+            return str(args.get("path", "."))
+        if name == "handoff":
+            target = args.get("next_agent", "")
+            task = " ".join(str(args.get("task", "")).split())
+            return f"→ {target}  ·  {task[:100]}"
+        if name in ("http_probe", "web_crawl", "dir_scan", "param_fuzz", "cors_check", "waf_detect"):
+            return str(args.get("url") or args.get("base_url") or "")
+        if name in ("port_scan", "subdomain_enum"):
+            return str(args.get("host") or args.get("domain") or "")
+        if name == "dns_zone_transfer":
+            return str(args.get("domain") or "")
+        if name == "tcp_exchange":
+            return f"{args.get('host', '')}:{args.get('port', '')}"
+        if name == "jwt_analyze":
+            return str(args.get("token", ""))[:80]
+        if name == "codec":
+            return f"{args.get('operation', 'encode')} · {args.get('format', 'base64')}"
+        if name == "payload_forge":
+            return str(args.get("category", ""))
+        if name in ("binary_info", "file_analyze", "archive_extract", "artifact_scan", "flag_hunt"):
+            return str(args.get("path", "."))
     except Exception:
         pass
     return json.dumps(args, ensure_ascii=False)[:140]
@@ -520,6 +608,10 @@ class ApprovalBar(QFrame):
     def set_payload(self, payload: dict) -> None:
         calls = payload.get("calls") or []
         self._calls = calls
+        worker_label = str(payload.get("worker_label") or "").strip()
+        self.title.setText(
+            f"需要你的确认 · {worker_label}" if worker_label else "需要你的确认"
+        )
         self.count_label.setText(f"{len(calls)} 项工具调用")
         lines: list[str] = []
         for call in calls[:4]:

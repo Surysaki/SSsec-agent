@@ -1,22 +1,23 @@
 """SSsec 的测试工具集。
 
 网络工具会在调用前记录目标与当前范围策略；范围默认不拦截，可在设置中
-切换为“仅提示”或“严格拦截”。命令执行在标准模式下仍需要操作员批准，
-“完全权限”对话或关闭审批后会直接执行。工具输出统一为 JSON 字符串，
-方便模型读取，也方便 UI 展示与审计。
+切换为“仅提示”或“严格拦截”。命令执行在默认宽松模式下只对高风险命令
+请求确认，保守模式逐条批准，“完全权限”对话会直接执行。工具输出统一为
+JSON 字符串，方便模型读取，也方便 UI 展示与审计。
 """
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import os
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -26,61 +27,281 @@ import dns.resolver
 import httpx
 from langchain_core.tools import BaseTool, tool
 
+from sssec import __version__
 from sssec.agent.runtime import AgentContext
+from sssec.agent.state import HANDOFF_TARGETS
+from sssec.agent.toolkit import (
+    MAX_TOOL_OUTPUT,
+    err as _err,
+    normalize_host as _normalize_host,
+    ok as _ok,
+    read_limited as _read_limited,
+    result_ok as _result_ok,
+    safe_workspace_path,
+    truncate_middle,
+)
+from sssec.agent.tools_ctf import build_ctf_tools
+from sssec.agent.tools_recon import build_recon_tools
+from sssec.agent.tools_web import build_web_tools
 from sssec.models import SEVERITIES, new_id, now_iso
 
-MAX_TOOL_OUTPUT = 16000
 MAX_HTTP_BODY_BYTES = 262144
 MAX_HTTP_BODY_CHARS = 12000
 ALLOWED_HTTP_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 ALLOWED_DNS_TYPES = {"A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "CAA", "PTR"}
 
 
-def _json(data: Any) -> str:
-    text = json.dumps(data, ensure_ascii=False, default=str)
-    return truncate_middle(text, MAX_TOOL_OUTPUT)
+def _safe_workspace_path(ctx: AgentContext, raw_path: str) -> Path:
+    return safe_workspace_path(ctx.workspace, raw_path)
 
 
-def _ok(data: dict[str, Any]) -> str:
-    return _json({"ok": True, "data": data})
+async def _whois_lookup(ctx: AgentContext, host: str) -> str:
+    host = _normalize_host(host)
+    if not host:
+        return _err("主机名无效")
+    decision = ctx.check_host(host)
+    if not decision.allowed:
+        return _err(f"目标范围拒绝：{decision.reason}")
 
+    timeout = max(5, int(ctx.settings.safety.network_timeout))
 
-def _err(message: str, **extra: Any) -> str:
-    return _json({"ok": False, "error": message, **extra})
+    async def query(server: str, payload: str) -> str:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(server, 43), timeout=timeout
+        )
+        try:
+            writer.write(payload.encode("utf-8", errors="ignore"))
+            await writer.drain()
+            data, _truncated = await _read_limited(reader, 24_000)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        return data.decode("utf-8", errors="replace")
 
-
-def truncate_middle(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
-    if len(text) <= limit:
-        return text
-    head = int(limit * 0.62)
-    tail = limit - head - 24
-    return text[:head] + "\n…（输出过长，中间已截断）…\n" + text[-tail:]
-
-
-def _result_ok(text: str) -> bool:
     try:
-        parsed = json.loads(text)
-        return bool(parsed.get("ok", True)) if isinstance(parsed, dict) else True
-    except Exception:
-        return True
+        first = await asyncio.wait_for(query("whois.iana.org", host + "\r\n"), timeout=timeout + 3)
+    except (OSError, asyncio.TimeoutError) as exc:
+        return _err(f"WHOIS 查询失败：{type(exc).__name__}: {truncate_middle(str(exc), 300)}")
 
-
-async def _read_limited(stream: asyncio.StreamReader, limit: int) -> tuple[bytes, bool]:
-    """持续排空子进程输出，但只在内存中保留最多 limit 字节。"""
-    chunks: list[bytes] = []
-    kept = 0
-    truncated = False
-    while True:
-        chunk = await stream.read(8192)
-        if not chunk:
+    referral = None
+    for line in first.splitlines():
+        if line.lower().startswith("refer:"):
+            referral = line.split(":", 1)[1].strip()
             break
-        if kept < limit:
-            take = min(len(chunk), limit - kept)
-            chunks.append(chunk[:take])
-            kept += take
-        if kept >= limit:
-            truncated = True
-    return b"".join(chunks), truncated
+
+    response = first
+    used_server = "whois.iana.org"
+    if referral and referral != used_server and len(referral) <= 253:
+        try:
+            response = await asyncio.wait_for(
+                query(referral, host + "\r\n"), timeout=timeout + 3
+            )
+            used_server = referral
+        except (OSError, asyncio.TimeoutError):
+            # 转介服务器失败时保留 IANA 的返回。
+            pass
+
+    return _ok(
+        {
+            "host": host,
+            "server": used_server,
+            "response": truncate_middle(response, 12000),
+            "scope_matched": decision.matched,
+            "scope_mode": decision.mode,
+            "scope_warning": decision.warning,
+        }
+    )
+
+
+def _name_to_dict(name: Any) -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        for item in name or ():
+            for key, value in item:
+                result[str(key)] = str(value)
+    except Exception:
+        pass
+    return result
+
+
+async def _tls_certificate(ctx: AgentContext, host: str, port: int = 443) -> str:
+    host = _normalize_host(host)
+    if not host:
+        return _err("主机名无效")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return _err("端口无效")
+    if not 1 <= port <= 65535:
+        return _err("端口超出范围")
+    decision = ctx.check_host(host)
+    if not decision.allowed:
+        return _err(f"目标范围拒绝：{decision.reason}")
+
+    timeout = max(5, int(ctx.settings.safety.network_timeout))
+    context = ssl.create_default_context()
+    writer = None
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=context, server_hostname=host),
+            timeout=timeout,
+        )
+        ssl_object = writer.get_extra_info("ssl_object")
+        if ssl_object is None:
+            return _err("未能建立 TLS 会话")
+        cert = ssl_object.getpeercert() or {}
+        cipher = ssl_object.cipher() or ("", "", 0)
+        version = ssl_object.version() or ""
+        expires_at = cert.get("notAfter", "")
+        days_remaining = None
+        try:
+            expires_at = ssl.cert_time_to_seconds(expires_at)
+            days_remaining = int((expires_at - time.time()) // 86400)
+            expires_at = datetime.fromtimestamp(expires_at).astimezone().isoformat(
+                timespec="seconds"
+            )
+        except Exception:
+            pass
+        return _ok(
+            {
+                "host": host,
+                "port": port,
+                "tls_version": version,
+                "cipher": {"name": cipher[0], "protocol": cipher[1], "bits": cipher[2]},
+                "subject": _name_to_dict(cert.get("subject")),
+                "issuer": _name_to_dict(cert.get("issuer")),
+                "serial_number": cert.get("serialNumber", ""),
+                "not_before": cert.get("notBefore", ""),
+                "not_after": expires_at,
+                "days_remaining": days_remaining,
+                "subject_alt_names": [
+                    value for kind, value in (cert.get("subjectAltName") or ()) if kind == "DNS"
+                ][:50],
+                "scope_matched": decision.matched,
+                "scope_mode": decision.mode,
+                "scope_warning": decision.warning,
+            }
+        )
+    except ssl.SSLError as exc:
+        return _err(f"TLS 握手失败：{truncate_middle(str(exc), 400)}")
+    except (OSError, asyncio.TimeoutError) as exc:
+        return _err(f"TLS 连接失败：{type(exc).__name__}: {truncate_middle(str(exc), 300)}")
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+def _workspace_list(ctx: AgentContext, path: str = ".") -> str:
+    try:
+        target = _safe_workspace_path(ctx, path)
+    except ValueError as exc:
+        return _err(str(exc))
+    if not target.exists():
+        return _err(f"路径不存在：{target.relative_to(Path(ctx.workspace).resolve())}")
+    if target.is_file():
+        stat = target.stat()
+        return _ok(
+            {
+                "path": str(target.relative_to(Path(ctx.workspace).resolve())),
+                "type": "file",
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime)
+                .astimezone()
+                .isoformat(timespec="seconds"),
+            }
+        )
+    entries = []
+    for child in sorted(target.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
+        try:
+            stat = child.stat()
+            entries.append(
+                {
+                    "name": child.name,
+                    "type": "dir" if child.is_dir() else "file",
+                    "size": 0 if child.is_dir() else stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime)
+                    .astimezone()
+                    .isoformat(timespec="seconds"),
+                }
+            )
+        except OSError:
+            continue
+        if len(entries) >= 200:
+            break
+    return _ok(
+        {
+            "path": str(target.relative_to(Path(ctx.workspace).resolve())),
+            "entries": entries,
+            "truncated": len(entries) >= 200,
+        }
+    )
+
+
+def _workspace_read(ctx: AgentContext, path: str, max_bytes: int = 20000) -> str:
+    try:
+        target = _safe_workspace_path(ctx, path)
+    except ValueError as exc:
+        return _err(str(exc))
+    if not target.exists() or not target.is_file():
+        return _err("文件不存在")
+    try:
+        limit = max(1, min(200000, int(max_bytes)))
+    except (TypeError, ValueError):
+        limit = 20000
+    try:
+        with target.open("rb") as handle:
+            data = handle.read(limit + 1)
+    except OSError as exc:
+        return _err(f"读取失败：{exc}")
+    truncated = len(data) > limit
+    data = data[:limit]
+    text = data.decode("utf-8", errors="replace")
+    return _ok(
+        {
+            "path": str(target.relative_to(Path(ctx.workspace).resolve())),
+            "size": target.stat().st_size,
+            "truncated": truncated,
+            "content": text,
+        }
+    )
+
+
+def _workspace_write(
+    ctx: AgentContext,
+    path: str,
+    content: str,
+    append: bool = False,
+) -> str:
+    try:
+        target = _safe_workspace_path(ctx, path)
+    except ValueError as exc:
+        return _err(str(exc))
+    text = str(content or "")
+    if len(text) > 200000:
+        return _err("内容过长（上限 200000 字符）")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if append and target.exists():
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(text)
+        else:
+            target.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return _err(f"写入失败：{exc}")
+    return _ok(
+        {
+            "path": str(target.relative_to(Path(ctx.workspace).resolve())),
+            "size": target.stat().st_size,
+            "append": bool(append),
+        }
+    )
 
 
 async def _http_request(
@@ -89,6 +310,7 @@ async def _http_request(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     body: str | None = None,
+    insecure: bool = False,
 ) -> str:
     method = (method or "GET").upper().strip()
     if method not in ALLOWED_HTTP_METHODS:
@@ -100,7 +322,7 @@ async def _http_request(
         return _err("headers 必须是字符串键值对象")
 
     request_headers = {
-        "User-Agent": "SSsec/0.2 (authorized security testing)",
+        "User-Agent": f"SSsec/{__version__} (authorized security testing)",
         "Accept": "*/*",
     }
     for key, value in (headers or {}).items():
@@ -132,7 +354,7 @@ async def _http_request(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             follow_redirects=False,
-            verify=True,
+            verify=not insecure,
         ) as client:
             for _hop in range(6):
                 async with client.stream(
@@ -220,6 +442,89 @@ async def _http_request(
         return _err(f"HTTP 请求失败：{type(exc).__name__}: {truncate_middle(str(exc), 500)}")
     except Exception as exc:
         return _err(f"HTTP 请求异常：{type(exc).__name__}: {truncate_middle(str(exc), 500)}")
+
+
+async def _security_headers(ctx: AgentContext, url: str, insecure: bool = False) -> str:
+    """拉取一次响应并做常见安全响应头/信息泄露检查。"""
+    raw = await _http_request(ctx, url, "GET", insecure=insecure)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return raw if isinstance(raw, str) else _err("响应解析失败")
+    if not isinstance(parsed, dict) or not parsed.get("ok"):
+        return _err(
+            "HTTP 请求失败，无法分析响应头",
+            detail=str(parsed.get("error") if isinstance(parsed, dict) else parsed)[:500],
+        )
+    data = parsed.get("data") or {}
+    headers = {
+        str(key).lower(): str(value)
+        for key, value in (data.get("headers") or {}).items()
+    }
+
+    checks = {
+        "content-security-policy": "限制脚本/资源来源，降低 XSS 影响",
+        "strict-transport-security": "强制 HTTPS，降低降级与中间人风险",
+        "x-frame-options": "限制页面被第三方框架嵌入",
+        "x-content-type-options": "阻止 MIME 类型嗅探",
+        "referrer-policy": "限制 Referer 中的敏感信息",
+        "permissions-policy": "限制浏览器特性权限",
+        "cross-origin-opener-policy": "隔离跨源窗口",
+        "cross-origin-resource-policy": "限制跨源资源读取",
+    }
+    missing = [
+        {"header": header, "recommendation": reason}
+        for header, reason in checks.items()
+        if header not in headers
+    ]
+    present = [
+        {"header": header, "value": headers.get(header, "")[:500]}
+        for header in checks
+        if header in headers
+    ]
+
+    disclosure = []
+    for header in ("server", "x-powered-by", "x-aspnet-version", "x-generator"):
+        if header in headers:
+            disclosure.append({"header": header, "value": headers[header][:300]})
+
+    cookie_issues: list[dict[str, str]] = []
+    for key, value in (data.get("headers") or {}).items():
+        if str(key).lower() != "set-cookie":
+            continue
+        lowered = str(value).lower()
+        issues = []
+        if "secure" not in lowered:
+            issues.append("缺少 Secure")
+        if "httponly" not in lowered:
+            issues.append("缺少 HttpOnly")
+        if "samesite" not in lowered:
+            issues.append("缺少 SameSite")
+        if issues:
+            cookie_issues.append(
+                {"cookie": str(value).split(";", 1)[0][:200], "issues": issues}
+            )
+
+    recommendations = [item["recommendation"] for item in missing]
+    if disclosure:
+        recommendations.append("收敛 Server / X-Powered-By 等版本与框架信息")
+    if cookie_issues:
+        recommendations.append("为 Cookie 增加 Secure / HttpOnly / SameSite 属性")
+
+    return _ok(
+        {
+            "url": data.get("url") or url,
+            "status_code": data.get("status_code"),
+            "present_headers": present,
+            "missing_headers": missing,
+            "cookie_issues": cookie_issues,
+            "information_disclosure": disclosure,
+            "recommendations": recommendations,
+            "scope_matched": data.get("scope_matched"),
+            "scope_mode": data.get("scope_mode"),
+            "scope_warning": data.get("scope_warning"),
+        }
+    )
 
 
 def _dns_lookup_sync(host: str, record_type: str, timeout: int) -> str:
@@ -486,12 +791,10 @@ def _save_finding(
     return _ok({"finding": finding, "total_findings": len(ctx.findings)})
 
 
-def _command_summary(command: str) -> str:
-    one_line = " ".join(command.split())
-    return one_line[:120] + ("…" if len(one_line) > 120 else "")
-
-
-def build_tools(ctx: AgentContext) -> list[BaseTool]:
+def _build_tool_definitions(
+    ctx: AgentContext,
+    names: list[str] | tuple[str, ...] | None = None,
+) -> list[BaseTool]:
     """构建绑定到本次运行上下文的 LangChain 工具。"""
 
     @tool("http_request")
@@ -500,12 +803,14 @@ def build_tools(ctx: AgentContext) -> list[BaseTool]:
         method: str = "GET",
         headers: dict[str, str] | None = None,
         body: str | None = None,
+        insecure: bool = False,
     ) -> str:
         """对目标发起一次 HTTP 请求并返回状态码、响应头（截断）和响应体（截断）。
 
         仅允许 http/https；当前范围策略会记录在结果中，严格模式下会拦截范围外目标。
+        ``insecure=True`` 可跳过 TLS 证书校验，仅用于 CTF/自签名靶场。
         """
-        return await _http_request(ctx, url, method, headers, body)
+        return await _http_request(ctx, url, method, headers, body, insecure)
 
     @tool("dns_lookup")
     async def dns_lookup(host: str, record_type: str = "A") -> str:
@@ -521,8 +826,9 @@ def build_tools(ctx: AgentContext) -> list[BaseTool]:
     async def run_command(command: str) -> str:
         """在会话专属工作目录中执行 PowerShell（Windows）或 bash 命令。
 
-        标准模式下该工具需要操作员批准；开启“完全权限”后直接执行。输出会截断，
-        不要执行破坏性、持久化或明显超出测试目的的命令。
+        默认宽松模式下只有明显高风险命令需要操作员确认；保守模式逐条批准；
+        完全权限直接执行。输出会截断，不要执行破坏性、持久化或明显超出
+        测试目的的命令。
         """
         return await _run_command(ctx, command)
 
@@ -537,10 +843,108 @@ def build_tools(ctx: AgentContext) -> list[BaseTool]:
         """把一条已经验证的测试发现记录到当前会话。severity 必须是 critical、high、medium、low、info 之一。"""
         return _save_finding(ctx, title, severity, description, target, evidence)
 
-    tools: list[BaseTool] = [http_request, dns_lookup, tcp_probe]
+    @tool("whois_lookup")
+    async def whois_lookup(host: str) -> str:
+        """查询域名或 IP 的 WHOIS 注册信息（先查 IANA，再自动跟随 refer 转介）。"""
+        return await _whois_lookup(ctx, host)
+
+    @tool("tls_certificate")
+    async def tls_certificate(host: str, port: int = 443) -> str:
+        """读取目标 TLS 证书的颁发者、有效期、SAN、协议版本与加密套件。"""
+        return await _tls_certificate(ctx, host, port)
+
+    @tool("security_headers")
+    async def security_headers(url: str, insecure: bool = False) -> str:
+        """检查目标 HTTP 安全响应头、Cookie 属性与 Server/X-Powered-By 信息泄露。"""
+        return await _security_headers(ctx, url, insecure)
+
+    @tool("workspace_list")
+    def workspace_list(path: str = ".") -> str:
+        """列出会话工作目录中的文件与子目录（限制在工作目录内）。"""
+        return _workspace_list(ctx, path)
+
+    @tool("workspace_read")
+    def workspace_read(path: str, max_bytes: int = 20000) -> str:
+        """读取会话工作目录中的文本文件（限制在工作目录内，最多 200000 字节）。"""
+        return _workspace_read(ctx, path, max_bytes)
+
+    @tool("workspace_write")
+    def workspace_write(path: str, content: str, append: bool = False) -> str:
+        """把文本写入会话工作目录（限制在工作目录内）。用于保存证据、脚本和中间结果。"""
+        return _workspace_write(ctx, path, content, append)
+
+    mapping: dict[str, BaseTool] = {
+        "http_request": http_request,
+        "dns_lookup": dns_lookup,
+        "tcp_probe": tcp_probe,
+        "save_finding": save_finding,
+        "whois_lookup": whois_lookup,
+        "tls_certificate": tls_certificate,
+        "security_headers": security_headers,
+        "workspace_list": workspace_list,
+        "workspace_read": workspace_read,
+        "workspace_write": workspace_write,
+    }
+    mapping.update(build_recon_tools(ctx))
+    mapping.update(build_web_tools(ctx))
+    mapping.update(build_ctf_tools(ctx))
     if ctx.settings.safety.enable_shell:
-        tools.append(run_command)
-    tools.append(save_finding)
+        mapping["run_command"] = run_command
+    if names is None:
+        return list(mapping.values())
+    return [mapping[name] for name in names if name in mapping]
+
+
+@tool("handoff")
+def handoff(
+    next_agent: str,
+    task: str,
+    reason: str = "",
+    summary: str = "",
+) -> str:
+    """当你完成当前阶段、确认可以把任务交给下一个阶段时调用。
+
+    next_agent 必须是 recon、vuln_analysis、exploit、post_exploit 或 finish。
+    调用后当前子 Agent 会结束，由指挥官决定是否采纳这次交接。
+    """
+    target = str(next_agent or "").strip()
+    if target not in HANDOFF_TARGETS:
+        return _err(
+            "next_agent 必须是 recon、vuln_analysis、exploit、post_exploit 或 finish",
+            allowed=list(HANDOFF_TARGETS),
+        )
+    brief = str(task or "").strip()
+    if target != "finish" and not brief:
+        return _err("交接给下一个 Agent 时 task 不能为空")
+    return _ok(
+        {
+            "next_agent": target,
+            "task": brief[:4000],
+            "reason": str(reason or "").strip()[:1000],
+            "summary": str(summary or "").strip()[:4000],
+        }
+    )
+
+
+def build_tools(
+    ctx: AgentContext,
+    names: list[str] | tuple[str, ...] | None = None,
+) -> list[BaseTool]:
+    """构建工具列表。
+
+    ``names`` 为空时返回全部可用工具；子 Agent 传入自己的工具名即可获得
+    专属工具集，实现“每个阶段各自丰富工具”。
+    """
+    return _build_tool_definitions(ctx, names)
+
+
+def build_worker_tools(
+    ctx: AgentContext,
+    names: list[str] | tuple[str, ...],
+) -> list[BaseTool]:
+    """子 Agent 工具集：专属工具 + 交接工具。"""
+    tools = _build_tool_definitions(ctx, names)
+    tools.append(handoff)
     return tools
 
 
@@ -549,5 +953,7 @@ __all__ = [
     "ALLOWED_HTTP_METHODS",
     "MAX_TOOL_OUTPUT",
     "build_tools",
+    "build_worker_tools",
+    "handoff",
     "truncate_middle",
 ]

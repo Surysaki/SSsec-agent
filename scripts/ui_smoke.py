@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from langchain_core.language_models.chat_models import BaseChatModel  # noqa: E402
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage  # noqa: E402
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage  # noqa: E402
 from langchain_core.outputs import ChatGeneration, ChatResult  # noqa: E402
 from pydantic import PrivateAttr  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -46,6 +47,22 @@ class ScreenshotToolModel(BaseChatModel):
     def _generate(
         self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs
     ) -> ChatResult:
+        system = "\n".join(
+            str(item.content) for item in messages if isinstance(item, SystemMessage)
+        )
+        if "指挥官（Supervisor）" in system:
+            finished = "已完成阶段: 无" not in system
+            reply = json.dumps(
+                {
+                    "next": "finish" if finished else "exploit",
+                    "task": "" if finished else "执行一次无害命令验证",
+                    "reason": "截图脚本的指挥官调度",
+                    "summary": "多 Agent 流程验证完成。" if finished else "",
+                },
+                ensure_ascii=False,
+            )
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=reply))])
+
         self._calls += 1
         if self._calls == 1:
             message = AIMessage(
@@ -61,7 +78,10 @@ class ScreenshotToolModel(BaseChatModel):
             )
         else:
             it = [item for item in messages if isinstance(item, ToolMessage)]
-            message = AIMessage(content="界面端到端验证完成。" + (it[-1].content[:120] if it else ""))
+            message = AIMessage(
+                content="界面端到端验证完成，命令输出已记录在工具卡片中。"
+                + (f"（{len(it)} 条工具结果）" if it else "")
+            )
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
@@ -130,6 +150,9 @@ def main() -> None:
 
     import sssec.agent.graph as graph_module
 
+    # 截图脚本显式使用保守审批，确保能看到审批条；默认的宽松模式会让
+    # `echo` 这类低风险命令直接执行。
+    window.settings.safety.approval_mode = "sensitive"
     graph_module.build_chat_model = lambda *a, **k: ScreenshotToolModel()
     window._send_message("执行一次无害的命令验证。")
     wait_for(app, lambda: window.pending_approval is not None, 15)
@@ -162,6 +185,8 @@ def main() -> None:
     capture(findings, output, "05-findings.png")
     findings.close()
 
+    # 截图设置页时恢复默认的宽松审批，避免沿用审批演示的保守设置。
+    window.settings.safety.approval_mode = "relaxed"
     settings = SettingsDialog(window.settings, window.data_dir, window)
     settings.resize(980, 710)
     settings.show()

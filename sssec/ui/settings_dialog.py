@@ -436,8 +436,10 @@ class SettingsDialog(QDialog):
         card_layout.addWidget(self.approval_combo)
         card_layout.addWidget(
             _help_label(
-                "默认只对命令执行等敏感工具请求确认。选择“关闭审批”或“完全权限”后，"
-                "工具会直接执行，不再弹出确认条；完全权限还会同时取消范围拦截。"
+                "默认为“宽松”：只读工具与普通命令直接执行，仅明显高风险命令"
+                "（破坏性、持久化、关机/格式化、管道执行远程脚本等）请求确认。"
+                "“仅敏感工具”保留更保守的命令与写请求审批；"
+                "“关闭审批”或“完全权限”会让所有工具直接执行。"
             )
         )
         card_layout.addWidget(divider())
@@ -458,8 +460,8 @@ class SettingsDialog(QDialog):
         card_layout.addWidget(self.enable_shell)
         card_layout.addWidget(
             _help_label(
-                "命令在会话专属工作目录中运行，并继承当前用户权限。标准模式下仍需逐条审批；"
-                "完全权限下会直接执行。"
+                "命令在会话专属工作目录中运行，并继承当前用户权限。默认宽松模式"
+                "只对高风险命令请求确认；保守模式逐条审批；完全权限下直接执行。"
             )
         )
         layout.addWidget(card)
@@ -690,7 +692,7 @@ class SettingsDialog(QDialog):
         about_text.addWidget(about_title)
         desc = QLabel(
             "本地优先的安全测试 Agent Harness，默认白色主题、可切换深色。"
-            "Agent 运行时：LangGraph；模型与工具抽象：LangChain；桌面界面：PySide6。"
+            "多 Agent 运行时：LangGraph 指挥官 + 阶段子图；桌面界面：PySide6。"
         )
         desc.setObjectName("HelpText")
         desc.setWordWrap(True)

@@ -135,15 +135,29 @@ def assistant_text(message: dict[str, Any]) -> str:
     return message_text(message)
 
 
-def append_text(message: dict[str, Any], text: str, kind: str = "text") -> None:
+def append_text(
+    message: dict[str, Any],
+    text: str,
+    kind: str = "text",
+    *,
+    commander: bool = False,
+) -> None:
     if not text:
         return
     seg_type = "reasoning" if kind == "reasoning" else "text"
+    is_commander = bool(commander and seg_type == "reasoning")
     segments = message.setdefault("segments", [])
-    if segments and segments[-1].get("type") == seg_type:
+    if (
+        segments
+        and segments[-1].get("type") == seg_type
+        and bool(segments[-1].get("commander")) == is_commander
+    ):
         segments[-1]["text"] = str(segments[-1].get("text") or "") + text
     else:
-        segments.append({"type": seg_type, "text": text})
+        segment: dict[str, Any] = {"type": seg_type, "text": text}
+        if is_commander:
+            segment["commander"] = True
+        segments.append(segment)
     if seg_type == "text":
         message["content"] = assistant_text(message)
 

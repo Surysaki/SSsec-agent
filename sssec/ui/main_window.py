@@ -38,12 +38,10 @@ from sssec.agent.history import conversation_to_messages
 from sssec.agent.llm import ModelConfigError, friendly_error, validate_provider
 from sssec.agent.worker import AgentWorker
 from sssec.config import (
-    APP_VERSION,
     AppSettings,
     SettingsStore,
     ensure_data_dirs,
     get_data_dir,
-    is_strong_encryption,
     load_ui_state,
     save_ui_state,
 )
@@ -829,6 +827,7 @@ class MainWindow(QMainWindow):
         self._retired_workers.append(worker)
         worker.text_delta.connect(self._on_text_delta)
         worker.reasoning_delta.connect(self._on_reasoning_delta)
+        worker.commander_delta.connect(self._on_commander_delta)
         worker.tool_started.connect(self._on_tool_started)
         worker.tool_finished.connect(self._on_tool_finished)
         worker.approval_required.connect(self._on_approval_required)
@@ -871,6 +870,16 @@ class MainWindow(QMainWindow):
         if message is None:
             return
         append_text(message, text, "reasoning")
+        self._dirty = True
+
+    def _on_commander_delta(self, text: str) -> None:
+        if not text:
+            return
+        message = self._assistant_message()
+        if message is None:
+            return
+        # 指挥官决策不是模型的 reasoning_content，单独标记，避免跨轮误传回模型。
+        append_text(message, text, "reasoning", commander=True)
         self._dirty = True
 
     def _on_tool_started(self, payload: dict) -> None:
