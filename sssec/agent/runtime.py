@@ -117,6 +117,15 @@ class AgentContext:
     # 本题需要找的 flag 总数；单 Agent 用它判断是否继续深挖。
     target_flags: int = 1
     model: Any = None
+    _skill_store: Any = None
+
+    def skill_store(self):
+        """技能库（惰性创建，测试与 UI 共用同一数据目录）。"""
+        if self._skill_store is None:
+            from sssec.skills import SkillStore
+
+            self._skill_store = SkillStore(self.data_dir)
+        return self._skill_store
 
     def emit_text(self, text: str) -> None:
         if text:

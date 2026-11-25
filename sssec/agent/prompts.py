@@ -119,6 +119,7 @@ COMMANDER_RULES = """## 你的角色：指挥官（Supervisor）
 - `exploit` 漏洞利用 Agent：{exploit}
 - `post_exploit` 后渗透 Agent：{post}
 - `reverse` 逆向分析 Agent：{reverse}
+- `final` 最终突破 Agent：汇总全部证据、拥有全部工具，用于前面阶段反复卡住时重新建模突破。
 
 ### 调度规则
 1. 一般顺序是 recon → vuln_analysis → exploit → post_exploit → finish，但允许根据证据跳阶段或回退；
@@ -126,9 +127,15 @@ COMMANDER_RULES = """## 你的角色：指挥官（Supervisor）
 2. 每次只派一个 Agent；任务简报必须具体、可执行，包含目标、已知线索和期望产出。
 3. 如果上一阶段通过 handoff 明确建议了下一个 Agent，优先考虑该建议；只有证据表明它不合适时才改写。
 4. 不要重复已经完成且没有新输入的阶段。需要回退时，必须说明新的验证角度。
-5. 当目标已达成、关键证据已收集、无法继续或达到最大阶段数时，返回 `finish`，并给出简洁收尾摘要。
+5. **只有以下两种情况可以返回 `finish`**：① 目标已经达成（例如拿到 flag、证据链闭合）；
+   ② 确认无法继续——同一路线失败至少两次、关键入口都验证过，并在 `summary` 里写清已验证事实与剩余攻击面。
 6. 如果用户只是普通问答、不需要任何工具或阶段推进，直接返回 `finish`，把回答写进 `summary`。
-7. 不要为了“多跑一个阶段”而延长流程。能在当前证据下收尾就直接收尾。
+7. **轮次和预算不再是收尾理由**：不要因为“阶段序号接近上限”“这一阶段跑了很多轮”就收尾。
+   目标没达成时，应该换阶段、换路线，或升级到 `final` 继续。
+8. 连续两次收到“没有新证据”的同类报告时，不要再原样重派：换一个阶段或 `final`，并把新思路写进 `task`。
+9. **技能卡**：下面有一份可用技能索引。如果下一阶段的任务明显命中某张卡的触发条件，
+   在 `task` 里写一句“建议先 `skill_load(<id>)`”，**一次只建议一张**。技能只是参考，
+   不是真相；不要因为卡里写了某结论就跳过验证。
 
 ### 场景提示
 - **CTF 解题 / tsecbench**：优先确认题目地址与服务；拿到 flag 就收尾，不要过度扫描。`flag_hunt`/`codec`/`binary_info`/`disassemble`/`crypto_workshop` 是常用工具。
@@ -139,7 +146,7 @@ COMMANDER_RULES = """## 你的角色：指挥官（Supervisor）
 ### 输出格式（严格 JSON，不要输出其他内容）
 ```json
 {{
-  "next": "recon|vuln_analysis|exploit|post_exploit|reverse|finish",
+  "next": "recon|vuln_analysis|exploit|post_exploit|reverse|final|finish",
   "task": "给下一个 Agent 的具体任务；finish 时可为空",
   "reason": "为什么这样调度",
   "summary": "finish 时的收尾摘要；未 finish 时可为空"
@@ -246,6 +253,7 @@ def build_commander_prompt(
     step: int,
     max_steps: int,
     handoff: dict[str, Any] | None,
+    skills_index: str = "",
 ) -> str:
     """构造指挥官的系统提示。"""
     completed = ", ".join(str(item.get("worker") or "") for item in reports) or "无"
@@ -264,15 +272,21 @@ def build_commander_prompt(
         post=WORKER_DESCRIPTIONS["post_exploit"],
         reverse=WORKER_DESCRIPTIONS["reverse"],
     )
+    skills_block = (
+        f"\n\n## 可用技能（按需加载）\n{skills_index}\n"
+        "如命中触发条件，在 task 里建议 `skill_load(<id>)`；一次只建议一张。"
+        if skills_index
+        else ""
+    )
     return f"""{common}
 
 {rules}
 
 ## 当前调度上下文
 - 用户总目标: {objective}
-- 当前阶段序号: {step} / {max_steps}
+- 调度序号: {step}（软预算 {max_steps}，超出只做策略复盘，不强制收尾）
 - 已完成阶段: {completed}
-- 上一阶段交接建议: {handoff_text}
+- 上一阶段交接建议: {handoff_text}{skills_block}
 
 ## 阶段报告
 {report_text}
@@ -299,6 +313,7 @@ def build_single_prompt(
 - 本题 flag 数量: {max(1, int(flag_count))}
 - 可用工具: {tools_text}
 - 你拥有全部工具，不要调用 `handoff`，也不要把任务留给“后续阶段”。
+- 技能卡：命中触发条件时先 `skill_list` 看清单，再 `skill_load(<id>)`（每阶段有上限，可 `skill_unload` 换卡）；技能是参考，不是真相。
 
 ## 执行纪律
 - 先完成上面的系统检查，再决定攻击面；不要一上来就猜 payload，也不要因为一次失败就结束。
@@ -352,6 +367,7 @@ def build_final_solver_prompt(
 - 总目标: {task or "根据用户消息和已有证据完成题目"}
 - 可用工具: {tools_text}
 - 你拥有全部工具，不要调用 `handoff`，也不要再交给其他阶段。
+- 技能卡：命中触发条件时先 `skill_list` 看清单，再 `skill_load(<id>)`（每阶段有上限，可 `skill_unload` 换卡）；技能是参考，不是真相。
 
 ## 最后突破要求
 - 先列出你**自己**认为最可疑的 2~3 个假设，再选择验证顺序；
@@ -369,12 +385,19 @@ def build_worker_prompt(
     task: str,
     tool_names: list[str],
     reports: list[dict[str, Any]],
+    skills_available: bool = False,
 ) -> str:
     """构造阶段子 Agent 的系统提示。"""
     label = WORKER_LABELS.get(worker, worker)
     role = WORKER_ROLE_PROMPTS.get(worker, "")
     tools_text = "、".join(f"`{name}`" for name in tool_names) or "无"
     previous = _render_reports(reports[-3:], compact=True)
+    skills_line = (
+        "- 技能卡：命中触发条件时先 `skill_list` 看清单，再 `skill_load(<id>)` "
+        "（每阶段有上限，可 `skill_unload` 换卡）；技能是参考，与工具证据冲突时以证据为准。\n"
+        if skills_available
+        else ""
+    )
     return f"""{common}
 
 {role}
@@ -383,14 +406,69 @@ def build_worker_prompt(
 - 阶段: {label}（`{worker}`）
 - 指挥官任务: {task or "按当前阶段职责推进"}
 - 可用工具: {tools_text}
-- 之前的阶段报告:
+{skills_line}- 之前的阶段报告:
 {previous}
 
 ## 阶段纪律
 - 只做当前阶段职责内的事；不要代替后续阶段直接推进。
 - 每次工具调用前说明目的；失败时如实说明并给出替代方案。
+- **轮次预算不是收尾理由**：只要还有可验证的下一步，就继续调用工具；不要在没做完时写总结。
 - 完成当前阶段、确认可以交接时，调用 `handoff` 工具；如果目标已完成，`next_agent` 用 `finish`。
-- 不要在没有调用 `handoff` 的情况下假装已经进入下一阶段。"""
+- 不要在没有调用 `handoff` 的情况下假装已经进入下一阶段。
+- 同一条命令/请求不要连续重复；连续两次没有新证据就换参数、换入口或换工具。"""
+
+
+def build_worker_continue_prompt(
+    *,
+    worker: str,
+    task: str,
+    tool_names: list[str],
+    reason: str,
+) -> str:
+    """阶段内“空转/循环”时的继续指令：要求给出具体动作，而不是再写总结。"""
+    label = WORKER_LABELS.get(worker, worker)
+    tools_text = "、".join(f"`{name}`" for name in tool_names) or "无"
+    return f"""继续执行。你刚才没有产生新的工具证据就准备结束（{reason}），但这个阶段的目标还没有完成。
+
+## 现在必须做的
+1. 用一句话说明：当前已经确认了什么、还缺什么。
+2. 立刻调用至少一个工具去验证下一步；不要再次输出总结。
+3. 如果确实无法继续，调用 `handoff` 并写清卡点与新的假设，而不是直接结束。
+4. 不要重复刚才已经做过的相同命令/请求。
+
+- 当前阶段: {label}（`{worker}`）
+- 阶段任务: {task or "按当前阶段职责推进"}
+- 可用工具: {tools_text}"""
+
+
+def build_auto_resume_prompt(
+    *,
+    objective: str,
+    summary: str,
+    reports: list[dict[str, Any]],
+    attempt: int,
+) -> str:
+    """整轮结束但目标未达成时，下一轮自动续跑的指令。"""
+    completed = " → ".join(
+        str(item.get("worker") or "") for item in (reports or [])[-6:]
+    ) or "无"
+    pending = str(summary or "").strip()[:1200] or "（上一轮没有给出明确的收尾摘要）"
+    return f"""继续。上一轮已经结束，但目标还没有达成，现在自动开始第 {max(1, int(attempt))} 次续跑。
+
+## 任务目标
+{objective or "按用户最初的请求继续"}
+
+## 上一轮结束时的状态
+{pending}
+
+## 已经跑过的阶段
+{completed or "无"}
+
+## 续跑要求
+1. 不要复述上一轮的结论，直接接着干活；先判断还差哪一步。
+2. 如果上一轮卡在工具能力或参数上，换一种实现方式（例如换请求方式、换脚本入口、换阶段）。
+3. 只有目标达成或确认 blocked 时才收尾。
+4. 你可以连续调用工具，轮次不再作为收尾理由。"""
 
 
 def _render_reports(reports: list[dict[str, Any]], compact: bool = False) -> str:
@@ -416,6 +494,9 @@ def _render_reports(reports: list[dict[str, Any]], compact: bool = False) -> str
             f"- 任务: {task or '未填写'}\n"
             f"- 摘要: {summary or '（无文本摘要）'}{handoff_text}"
         )
+        skills = report.get("skills") or []
+        if skills:
+            lines.append(f"- 技能: {', '.join(str(item) for item in skills)}")
         evidence = report.get("evidence") or []
         if evidence:
             rendered = []
@@ -432,10 +513,12 @@ def _render_reports(reports: list[dict[str, Any]], compact: bool = False) -> str
 __all__ = [
     "COMMANDER_RULES",
     "WORKER_ROLE_PROMPTS",
+    "build_auto_resume_prompt",
     "build_commander_prompt",
     "build_final_solver_prompt",
     "build_single_continue_prompt",
     "build_single_prompt",
     "build_system_prompt",
+    "build_worker_continue_prompt",
     "build_worker_prompt",
 ]

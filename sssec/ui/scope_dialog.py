@@ -1,4 +1,4 @@
-"""编辑对话标题、测试目标范围与完全权限。"""
+"""编辑对话标题、测试目标范围与完全权限（Linear 风格）。"""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from sssec.models import Conversation
 from sssec.security.scope import split_scope_text
 from sssec.ui.icons import icon
 from sssec.ui.theme import COLORS
-from sssec.ui.widgets import BrandMark
 
 
 class ScopeDialog(QDialog):
@@ -28,24 +27,33 @@ class ScopeDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("目标范围与执行权限 · SSsec")
         self.setModal(True)
-        self.resize(640, 660)
-        self.setMinimumSize(560, 580)
+        self.resize(680, 640)
+        self.setMinimumSize(580, 560)
         self.conversation = conversation
         self._scope_entries: list[str] = []
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 22, 24, 18)
-        root.setSpacing(13)
+        root.setContentsMargins(24, 20, 24, 16)
+        root.setSpacing(10)
 
         header = QHBoxLayout()
-        header.setSpacing(12)
-        header.addWidget(BrandMark(40), 0, Qt.AlignTop)
+        header.setSpacing(10)
+        badge = QLabel()
+        badge.setFixedSize(30, 30)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setPixmap(icon("target", COLORS["accent"], 16).pixmap(16, 16))
+        badge.setStyleSheet(
+            f"background: {COLORS['accent_soft']};"
+            f"border: 1px solid {COLORS['accent_border']};"
+            "border-radius: 7px;"
+        )
+        header.addWidget(badge, 0, Qt.AlignTop)
         header_text = QVBoxLayout()
-        header_text.setSpacing(3)
-        title = QLabel("设置测试目标与权限")
+        header_text.setSpacing(1)
+        title = QLabel("目标与权限")
         title.setObjectName("PageTitle")
         subtitle = QLabel(
-            "目标范围默认只作为提示与审计标记，不再阻断工具；需要时可在设置中开启严格拦截。"
+            "目标范围默认只作为提示与审计标记，不阻断工具；需要时可在设置中开启严格拦截。"
         )
         subtitle.setObjectName("PageSub")
         subtitle.setWordWrap(True)
@@ -53,7 +61,7 @@ class ScopeDialog(QDialog):
         header_text.addWidget(subtitle)
         header.addLayout(header_text, 1)
         root.addLayout(header)
-        root.addSpacing(2)
+        root.addSpacing(4)
 
         title_label = QLabel("对话名称")
         title_label.setObjectName("FieldLabel")
@@ -61,6 +69,7 @@ class ScopeDialog(QDialog):
         self.title_input.setPlaceholderText("例如：example.com 外部资产测试")
         root.addWidget(title_label)
         root.addWidget(self.title_input)
+        root.addSpacing(2)
 
         scope_label = QLabel("测试目标（可选）")
         scope_label.setObjectName("FieldLabel")
@@ -74,7 +83,7 @@ class ScopeDialog(QDialog):
             "https://demo.local:8443"
         )
         self.scope_input.setPlainText("\n".join(conversation.scope))
-        self.scope_input.setFixedHeight(128)
+        self.scope_input.setFixedHeight(120)
         self.scope_input.textChanged.connect(self._update_preview)
         root.addWidget(self.scope_input)
 
@@ -89,7 +98,7 @@ class ScopeDialog(QDialog):
         self.preview_frame = QFrame()
         self.preview_frame.setObjectName("Card")
         preview_layout = QHBoxLayout(self.preview_frame)
-        preview_layout.setContentsMargins(12, 8, 12, 8)
+        preview_layout.setContentsMargins(11, 9, 11, 9)
         preview_layout.setSpacing(8)
         self.preview_icon = QLabel()
         preview_layout.addWidget(self.preview_icon, 0, Qt.AlignTop)
@@ -102,17 +111,20 @@ class ScopeDialog(QDialog):
         access_card = QFrame()
         access_card.setObjectName("Card")
         access_layout = QVBoxLayout(access_card)
-        access_layout.setContentsMargins(13, 11, 13, 11)
+        access_layout.setContentsMargins(12, 10, 12, 10)
         access_layout.setSpacing(6)
         access_title_row = QHBoxLayout()
-        access_title_row.setSpacing(8)
+        access_title_row.setSpacing(7)
         bolt = QLabel()
-        bolt.setPixmap(icon("bolt", COLORS["red"], 17).pixmap(17, 17))
+        bolt.setPixmap(icon("bolt", COLORS["red"], 15).pixmap(15, 15))
         access_title_row.addWidget(bolt, 0, Qt.AlignVCenter)
         access_title = QLabel("完全权限")
         access_title.setObjectName("CardTitle")
         access_title_row.addWidget(access_title)
         access_title_row.addStretch(1)
+        scope_tag = QLabel("对话级")
+        scope_tag.setObjectName("Faint")
+        access_title_row.addWidget(scope_tag)
         access_layout.addLayout(access_title_row)
         self.full_checkbox = QCheckBox(
             "本对话启用完全权限：所有工具免确认，且不受目标范围限制"
@@ -126,11 +138,12 @@ class ScopeDialog(QDialog):
         )
         self.access_warning.setWordWrap(True)
         self.access_warning.setStyleSheet(
-            f"color: {COLORS['amber']}; font-size: 8.5pt;"
+            f"color: {COLORS['amber']}; font-size: 8.3pt;"
         )
         access_layout.addWidget(self.access_warning)
         root.addWidget(access_card)
 
+        root.addSpacing(2)
         warning = QLabel(
             "SSsec 无法替代你的授权审查。目标范围是技术提示，不是法律授权；"
             "请妥善保存授权书、测试窗口与应急联系方式。"
@@ -141,6 +154,7 @@ class ScopeDialog(QDialog):
         root.addStretch(1)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(7)
         buttons.addStretch(1)
         cancel = QPushButton("取消")
         cancel.setObjectName("Secondary")
@@ -163,13 +177,13 @@ class ScopeDialog(QDialog):
                 "完全权限已开启：工具调用不需要人工确认，也不会按目标范围拦截。"
             )
             self.preview_icon.setPixmap(
-                icon("bolt", COLORS["red"], 17).pixmap(17, 17)
+                icon("bolt", COLORS["red"], 15).pixmap(15, 15)
             )
             self.access_warning.setStyleSheet(
-                f"color: {COLORS['red']}; font-size: 8.5pt;"
+                f"color: {COLORS['red']}; font-size: 8.3pt;"
             )
         elif entries:
-            shown = "、".join(f"`{item}`" for item in entries[:5])
+            shown = "、".join(entries[:5])
             if len(entries) > 5:
                 shown += f" 等 {len(entries)} 项"
             self.preview_label.setText(
@@ -177,20 +191,20 @@ class ScopeDialog(QDialog):
                 "默认不拦截范围外目标；严格模式可在“设置 → Agent 与安全”中开启。"
             )
             self.preview_icon.setPixmap(
-                icon("target", COLORS["accent"], 17).pixmap(17, 17)
+                icon("target", COLORS["accent"], 15).pixmap(15, 15)
             )
             self.access_warning.setStyleSheet(
-                f"color: {COLORS['amber']}; font-size: 8.5pt;"
+                f"color: {COLORS['amber']}; font-size: 8.3pt;"
             )
         else:
             self.preview_label.setText(
                 "未设置目标：Agent 仍可执行网络与命令工具，范围策略默认为“不限制”。"
             )
             self.preview_icon.setPixmap(
-                icon("target", COLORS["faint"], 17).pixmap(17, 17)
+                icon("target", COLORS["faint"], 15).pixmap(15, 15)
             )
             self.access_warning.setStyleSheet(
-                f"color: {COLORS['amber']}; font-size: 8.5pt;"
+                f"color: {COLORS['amber']}; font-size: 8.3pt;"
             )
 
     def _save(self) -> None:
@@ -206,3 +220,6 @@ class ScopeDialog(QDialog):
         entries = split_scope_text(self.scope_input.toPlainText())
         authorized = bool(entries)
         return title, entries, authorized, bool(self.full_checkbox.isChecked())
+
+
+__all__ = ["ScopeDialog"]

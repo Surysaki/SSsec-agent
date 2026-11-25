@@ -95,6 +95,23 @@ def round_bonus_for(attempt: int, step: int, max_bonus: int) -> int:
     )
 
 
+def adaptive_attempt_seconds(
+    remaining: float,
+    pending_left: int,
+    max_seconds: int,
+    min_seconds: int = 90,
+) -> int:
+    """按「剩余时间 / 本轮剩余题数」分配单次尝试预算。
+
+    固定 ``--max-seconds`` 在题目多、总时限短的题集上会让第一轮只覆盖一部分题目
+    （例如 63 题 6 小时、每题 15 分钟，只能排到第 24 题）。动态预算保证在剩余
+    时间内把本轮每道题都走到；某一轮跑得比预期快时，后续轮次自然能拿到更多时间。
+    """
+    left = max(1, int(pending_left))
+    share = max(0.0, float(remaining)) / left
+    return int(max(int(min_seconds), min(int(max_seconds), share)))
+
+
 def mode_for_cycle(mode: str, cycle: int) -> str:
     """hybrid：第一遍单 Agent 扫题，后续轮次用多 Agent 深挖。"""
     normalized = (mode or "hybrid").strip().lower()
@@ -499,6 +516,9 @@ async def main_async(args: argparse.Namespace) -> int:
     evidence_by_code: dict[str, list[str]] = {}
     cycles = 0
     stop_run = False
+    budget_label = (
+        "动态(剩余时间/待跑题数)" if args.adaptive_budget else f"固定 {args.max_seconds}s"
+    )
 
     print(
         f"模型: {provider.name} / {provider.model} | "
@@ -508,7 +528,8 @@ async def main_async(args: argparse.Namespace) -> int:
         f"模式: {args.mode} | "
         f"每题总尝试: {'不限' if args.attempts <= 0 else args.attempts} | "
         f"每轮访问尝试: {max(1, args.attempts_per_visit)} | "
-        f"最终突破: 第 {max(2, args.final_solver_after) + 1} 次起"
+        f"最终突破: 第 {max(2, args.final_solver_after) + 1} 次起 | "
+        f"单次预算: {budget_label}"
     )
     print(
         f"轮次升级: 第 2 轮起 +{max(1, args.round_step)}，"
@@ -654,6 +675,13 @@ async def main_async(args: argparse.Namespace) -> int:
                             remaining = deadline - time.monotonic()
                             if remaining < 30:
                                 break
+                            attempt_seconds = args.max_seconds
+                            if args.adaptive_budget:
+                                attempt_seconds = adaptive_attempt_seconds(
+                                    remaining,
+                                    len(pending) - index + 1,
+                                    args.max_seconds,
+                                )
 
                             result: dict[str, Any] = {
                                 "text": [],
@@ -687,12 +715,14 @@ async def main_async(args: argparse.Namespace) -> int:
                                     "mode": attempt_mode,
                                     "round_bonus": bonus,
                                     "max_tool_rounds": settings.safety.max_tool_rounds,
+                                    "max_seconds": attempt_seconds,
                                     "prompt": prompt,
                                 }
                             )
                             print(
                                 f"  第 {attempt_no} 次尝试 | mode={attempt_mode} round_bonus={bonus} "
-                                f"max_tool_rounds={settings.safety.max_tool_rounds} | "
+                                f"max_tool_rounds={settings.safety.max_tool_rounds} "
+                                f"单次预算={attempt_seconds}s | "
                                 f"剩余 {max(0, int(remaining // 60))} 分钟"
                             )
                             try:
@@ -708,11 +738,11 @@ async def main_async(args: argparse.Namespace) -> int:
                                         mode=attempt_mode,
                                         result=result,
                                     ),
-                                    timeout=max(30, min(args.max_seconds, remaining)),
+                                    timeout=max(30, min(attempt_seconds, remaining)),
                                 )
                             except asyncio.TimeoutError:
-                                result["error"] = f"timeout after {args.max_seconds}s"
-                                print(f"  第 {attempt_no} 次尝试超时")
+                                result["error"] = f"timeout after {attempt_seconds}s"
+                                print(f"  第 {attempt_no} 次尝试超时（{attempt_seconds}s）")
 
                             if is_fatal_model_error(result["error"]):
                                 record["attempts"][-1]["error"] = result["error"]
@@ -845,6 +875,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-solver-after", type=int, default=3, help="第几次尝试后启用最终汇总突破 Agent（默认 3，即第 4 次起）")
     parser.add_argument("--final-rounds", type=int, default=20, help="最终汇总突破 Agent 的工具轮次上限（默认 20）")
     parser.add_argument("--max-seconds", type=int, default=900, help="每次尝试的时间上限（秒）")
+    parser.add_argument(
+        "--adaptive-budget",
+        action="store_true",
+        default=os.getenv("TSEC_ADAPTIVE_BUDGET", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="按剩余时间/本轮剩余题数动态分配单次尝试预算，保证每道题都能被覆盖（也可用 TSEC_ADAPTIVE_BUDGET=1）",
+    )
     parser.add_argument("--max-total-seconds", type=int, default=21600, help="总跑分时间上限（秒，默认 21600=360 分钟）")
     parser.add_argument("--max-total-minutes", type=float, default=0, help="总跑分时间上限（分钟，优先于 --max-total-seconds）")
     parser.add_argument("--max-rounds", type=int, default=16, help="第一轮的全局工具轮次上限（1-20）")

@@ -43,21 +43,27 @@ class ChatView(QScrollArea):
         self._programmatic_scroll = False
         self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
         self.verticalScrollBar().rangeChanged.connect(self._on_range_changed)
+        # 合帧滚动：流式 delta 很密集时只保留一个 16ms 回调，避免每个
+        # token 都排一次滚动/布局。
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.setInterval(16)
+        self._scroll_timer.timeout.connect(self._scroll_to_bottom)
 
         host = QWidget()
         host.setObjectName("ChatCanvas")
         outer = QHBoxLayout(host)
-        outer.setContentsMargins(26, 0, 26, 0)
+        outer.setContentsMargins(32, 0, 32, 0)
         outer.setSpacing(0)
         outer.addStretch(1)
         self._column = QWidget()
         self._column.setObjectName("ChatColumn")
-        self._column.setMaximumWidth(920)
+        self._column.setMaximumWidth(784)
         self._column.setMinimumWidth(320)
         self._column.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._column_layout = QVBoxLayout(self._column)
-        self._column_layout.setContentsMargins(0, 26, 0, 24)
-        self._column_layout.setSpacing(20)
+        self._column_layout.setContentsMargins(0, 24, 0, 22)
+        self._column_layout.setSpacing(22)
         self._column_layout.addStretch(1)
         outer.addWidget(self._column, 20)
         outer.addStretch(1)
@@ -83,7 +89,25 @@ class ChatView(QScrollArea):
             stick = self._stick_to_bottom
             widget.append_delta(kind, text)
             if stick:
-                QTimer.singleShot(20, self._scroll_to_bottom)
+                self._request_scroll()
+
+    def append_message(self, message: dict) -> QWidget | None:
+        """只追加一条新消息，不重建已有历史。"""
+        if self._empty is not None:
+            self._clear()
+            self._column_layout.addStretch(1)
+        widget = self._create_message_widget(message)
+        if widget is None:
+            return None
+        self._widgets[str(message.get("id"))] = widget
+        count = self._column_layout.count()
+        has_stretch = count > 0 and self._column_layout.itemAt(count - 1).spacerItem() is not None
+        if not has_stretch:
+            self._column_layout.addStretch(1)
+        self._column_layout.insertWidget(self._column_layout.count() - 1, widget)
+        if self._stick_to_bottom:
+            self._request_scroll()
+        return widget
 
     def refresh_message(self, message: dict) -> None:
         widget = self._widgets.get(str(message.get("id")))
@@ -91,7 +115,11 @@ class ChatView(QScrollArea):
             stick = self._stick_to_bottom
             widget.sync_from_data(message)
             if stick:
-                QTimer.singleShot(20, self._scroll_to_bottom)
+                self._request_scroll()
+
+    def _request_scroll(self) -> None:
+        if not self._scroll_timer.isActive():
+            self._scroll_timer.start()
 
     def scroll_to_bottom(self, force: bool = True) -> None:
         if force:

@@ -1,4 +1,4 @@
-"""左侧品牌栏、会话列表与模型入口。"""
+"""左侧工作区栏：品牌、会话列表与模型入口（Linear 风格）。"""
 
 from __future__ import annotations
 
@@ -21,11 +21,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sssec import __version__
 from sssec.models import Conversation, relative_time
 from sssec.ui.disposal import dispose_widget
 from sssec.ui.icons import icon
 from sssec.ui.theme import COLORS, is_dark
-from sssec.ui.widgets import BrandMark, ClickFrame, set_dynamic_property
+from sssec.ui.widgets import (
+    BrandMark,
+    ClickFrame,
+    caption_label,
+    set_dynamic_property,
+    status_dot,
+)
 
 
 class ConversationRow(QFrame):
@@ -39,9 +46,25 @@ class ConversationRow(QFrame):
         self.setObjectName("ConversationRow")
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(11, 8, 9, 8)
-        layout.setSpacing(3)
+        self.setFixedHeight(44)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Linear 的选中态只用 2px 强调条 + 极浅底色，不用整块高亮。
+        self.indicator = QFrame()
+        self.indicator.setFixedSize(2, 16)
+        self.indicator.setStyleSheet(
+            f"background: {COLORS['accent']}; border-radius: 1px;"
+        )
+        self.indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        outer.addWidget(self.indicator, 0, Qt.AlignVCenter)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(1)
+        outer.addLayout(layout, 1)
 
         top = QHBoxLayout()
         top.setSpacing(6)
@@ -50,19 +73,14 @@ class ConversationRow(QFrame):
         self.title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         title = conversation.title or "新对话"
         metrics = self.title_label.fontMetrics()
-        self.title_label.setText(
-            metrics.elidedText(title, Qt.ElideRight, 168)
-        )
+        self.title_label.setText(metrics.elidedText(title, Qt.ElideRight, 150))
         self.title_label.setToolTip(title)
         top.addWidget(self.title_label, 1)
 
         if running:
-            running_label = QLabel("●")
-            running_label.setStyleSheet(
-                f"color: {COLORS['accent']}; font-size: 7pt;"
-            )
+            running_label = status_dot(COLORS["accent"], 6)
             running_label.setToolTip("正在生成")
-            top.addWidget(running_label)
+            top.addWidget(running_label, 0, Qt.AlignVCenter)
         self.time_label = QLabel(relative_time(conversation.updated_at))
         self.time_label.setObjectName("ConvoTime")
         top.addWidget(self.time_label, 0, Qt.AlignTop)
@@ -72,7 +90,7 @@ class ConversationRow(QFrame):
         preview.setObjectName("ConvoPreview")
         preview.setWordWrap(False)
         metrics = preview.fontMetrics()
-        preview.setText(metrics.elidedText(conversation.preview(), Qt.ElideRight, 200))
+        preview.setText(metrics.elidedText(conversation.preview(), Qt.ElideRight, 178))
         layout.addWidget(preview)
         self.set_selected(selected)
 
@@ -81,6 +99,7 @@ class ConversationRow(QFrame):
         set_dynamic_property(
             self.title_label, "selected", "true" if selected else "false"
         )
+        self.indicator.setVisible(selected)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
@@ -103,16 +122,14 @@ class ModelCard(ClickFrame):
     def __init__(self):
         super().__init__()
         self.setObjectName("ModelCard")
-        self.setFixedHeight(56)
+        self.setFixedHeight(46)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 8, 9, 8)
-        layout.setSpacing(9)
-        mark = QLabel()
-        mark.setPixmap(icon("spark", COLORS["accent"], 18).pixmap(18, 18))
-        mark.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        layout.addWidget(mark, 0, Qt.AlignVCenter)
+        layout.setContentsMargins(8, 6, 7, 6)
+        layout.setSpacing(8)
+        self.status = status_dot(COLORS["accent"], 6)
+        layout.addWidget(self.status, 0, Qt.AlignVCenter)
         text_layout = QVBoxLayout()
-        text_layout.setSpacing(2)
+        text_layout.setSpacing(1)
         self.name_label = QLabel("模型服务")
         self.name_label.setObjectName("ModelName")
         self.name_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -124,15 +141,15 @@ class ModelCard(ClickFrame):
         layout.addLayout(text_layout, 1)
         chevron = QLabel()
         chevron.setPixmap(
-            icon("chevron_right", COLORS["faint"], 15).pixmap(15, 15)
+            icon("chevron_right", COLORS["faint"], 13).pixmap(13, 13)
         )
         chevron.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         layout.addWidget(chevron)
 
     def set_model(self, name: str, meta: str) -> None:
         metrics = self.name_label.fontMetrics()
-        self.name_label.setText(metrics.elidedText(name, Qt.ElideRight, 180))
-        self.meta_label.setText(metrics.elidedText(meta, Qt.ElideRight, 190))
+        self.name_label.setText(metrics.elidedText(name, Qt.ElideRight, 176))
+        self.meta_label.setText(metrics.elidedText(meta, Qt.ElideRight, 188))
         self.setToolTip(f"{name}\n{meta}\n点击配置模型服务")
 
 
@@ -147,59 +164,64 @@ class Sidebar(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("Sidebar")
-        self.setFixedWidth(276)
+        self.setFixedWidth(264)
         self._conversations: list[Conversation] = []
         self._current_id: str | None = None
         self._running_id: str | None = None
         self._query = ""
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 18, 14, 12)
+        root.setContentsMargins(12, 12, 12, 10)
         root.setSpacing(0)
 
         brand_row = QHBoxLayout()
-        brand_row.setSpacing(10)
-        brand_row.addWidget(BrandMark(36), 0, Qt.AlignVCenter)
-        brand_text = QVBoxLayout()
-        brand_text.setSpacing(0)
+        brand_row.setContentsMargins(2, 0, 2, 0)
+        brand_row.setSpacing(8)
+        brand_row.addWidget(BrandMark(24), 0, Qt.AlignVCenter)
         name = QLabel("SSsec")
         name.setObjectName("BrandName")
-        sub = QLabel("SECURITY TESTING AGENT")
-        sub.setObjectName("BrandSub")
-        brand_text.addWidget(name)
-        brand_text.addWidget(sub)
-        brand_row.addLayout(brand_text, 1)
+        brand_row.addWidget(name, 0, Qt.AlignVCenter)
+        brand_row.addStretch(1)
         root.addLayout(brand_row)
-        root.addSpacing(18)
+        root.addSpacing(12)
 
-        self.new_button = QPushButton("  新建对话")
+        self.new_button = QPushButton("新建对话")
         self.new_button.setObjectName("NewChat")
-        self.new_button.setIcon(icon("plus", COLORS["accent_text"], 17))
+        self.new_button.setIcon(icon("plus", COLORS["text_soft"], 15))
+        self.new_button.setIconSize(QSize(15, 15))
         self.new_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.new_button.setFixedHeight(38)
+        self.new_button.setFixedHeight(30)
         self.new_button.clicked.connect(self.new_conversation_requested.emit)
         root.addWidget(self.new_button)
-        root.addSpacing(12)
+        root.addSpacing(8)
 
         self.search = QLineEdit()
         self.search.setObjectName("SearchInput")
         self.search.setPlaceholderText("搜索对话…")
         self.search.setClearButtonEnabled(True)
         self.search.addAction(
-            icon("search", COLORS["faint"], 15), QLineEdit.LeadingPosition
+            icon("search", COLORS["faint"], 14), QLineEdit.LeadingPosition
         )
         self.search.textChanged.connect(self._on_search)
+        self.search.setFixedHeight(30)
         root.addWidget(self.search)
-        root.addSpacing(15)
+        root.addSpacing(14)
 
         header = QHBoxLayout()
-        header.setContentsMargins(2, 0, 2, 0)
-        self.section_label = QLabel("对话")
-        self.section_label.setObjectName("SectionCaption")
+        header.setContentsMargins(4, 0, 4, 0)
+        header.setSpacing(6)
+        self.section_label = caption_label("对话")
         header.addWidget(self.section_label)
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("SectionCount")
+        header.addWidget(self.count_label)
         header.addStretch(1)
+        self.search_hint = QLabel("Ctrl K")
+        self.search_hint.setObjectName("KbdHint")
+        self.search_hint.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        header.addWidget(self.search_hint)
         root.addLayout(header)
-        root.addSpacing(5)
+        root.addSpacing(4)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -208,8 +230,8 @@ class Sidebar(QWidget):
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.list_host = QWidget()
         self.list_layout = QVBoxLayout(self.list_host)
-        self.list_layout.setContentsMargins(0, 0, 3, 8)
-        self.list_layout.setSpacing(3)
+        self.list_layout.setContentsMargins(0, 0, 2, 8)
+        self.list_layout.setSpacing(1)
         self.list_layout.addStretch(1)
         self.scroll.setWidget(self.list_host)
         root.addWidget(self.scroll, 1)
@@ -217,28 +239,36 @@ class Sidebar(QWidget):
         footer = QFrame()
         footer.setObjectName("SidebarFooter")
         footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(0, 10, 0, 0)
-        footer_layout.setSpacing(7)
+        footer_layout.setContentsMargins(0, 8, 0, 0)
+        footer_layout.setSpacing(2)
         self.model_card = ModelCard()
         self.model_card.clicked.connect(self.settings_requested.emit)
         footer_layout.addWidget(self.model_card)
+
         bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(2, 0, 2, 0)
-        self.authorized_hint = QLabel("仅限合法安全测试")
+        bottom_row.setContentsMargins(5, 2, 0, 0)
+        bottom_row.setSpacing(2)
+        self.authorized_hint = QLabel(f"v{__version__} · 仅限授权测试")
         self.authorized_hint.setObjectName("Faint")
         bottom_row.addWidget(self.authorized_hint)
         bottom_row.addStretch(1)
         self.theme_button = QToolButton()
         self.theme_button.setObjectName("IconButton")
-        self.theme_button.setIcon(icon("moon" if not is_dark() else "sun", COLORS["muted"], 15))
-        self.theme_button.setIconSize(QSize(15, 15))
+        self.theme_button.setIcon(
+            icon("moon" if not is_dark() else "sun", COLORS["muted"], 14)
+        )
+        self.theme_button.setIconSize(QSize(14, 14))
+        self.theme_button.setFixedSize(26, 26)
         self.theme_button.setToolTip("切换浅色 / 深色主题")
         self.theme_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.theme_button.clicked.connect(self.theme_toggle_requested.emit)
         bottom_row.addWidget(self.theme_button)
-        self.settings_button = QPushButton("设置")
-        self.settings_button.setObjectName("FooterLink")
-        self.settings_button.setIcon(icon("settings", COLORS["muted"], 15))
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("IconButton")
+        self.settings_button.setIcon(icon("settings", COLORS["muted"], 14))
+        self.settings_button.setIconSize(QSize(14, 14))
+        self.settings_button.setFixedSize(26, 26)
+        self.settings_button.setToolTip("设置与模型服务（Ctrl+,）")
         self.settings_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.settings_button.clicked.connect(self.settings_requested.emit)
         bottom_row.addWidget(self.settings_button)
@@ -296,13 +326,14 @@ class Sidebar(QWidget):
                 dispose_widget(widget)
 
         filtered = [c for c in self._conversations if self._matches(c)]
+        self.count_label.setText(str(len(filtered)) if filtered else "")
         if not filtered:
             empty = QLabel(
                 "没有匹配的对话" if self._query else "还没有对话，点击上方新建。"
             )
             empty.setObjectName("Faint")
             empty.setWordWrap(True)
-            empty.setContentsMargins(5, 12, 5, 12)
+            empty.setContentsMargins(6, 12, 6, 12)
             self.list_layout.addWidget(empty)
             self.list_layout.addStretch(1)
             return
@@ -332,9 +363,8 @@ class Sidebar(QWidget):
             groups.append(("更早", bucket_earlier))
 
         for group_name, items in groups:
-            caption = QLabel(group_name)
-            caption.setObjectName("SectionCaption")
-            caption.setContentsMargins(4, 9, 4, 2)
+            caption = caption_label(group_name)
+            caption.setContentsMargins(8, 10, 4, 3)
             self.list_layout.addWidget(caption)
             for conversation in items:
                 row = ConversationRow(
@@ -347,3 +377,6 @@ class Sidebar(QWidget):
                 row.delete_requested.connect(self.delete_requested.emit)
                 self.list_layout.addWidget(row)
         self.list_layout.addStretch(1)
+
+
+__all__ = ["Sidebar"]

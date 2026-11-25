@@ -11,7 +11,7 @@ MAX_TOOL_OUTPUT = 16000
 
 _FLAG_RE = re.compile(
     r"\b(?:flag|ctf|FLAG|CTF|DASCTF|HFCTF|NSSCTF|moectf|hgame|SCTF|"
-    r"BJDCTF|GKCTF|SUCTF|XCTF|TCTF)\{[^}\r\n]{1,200}\}",
+    r"BJDCTF|GKCTF|SUCTF|XCTF|TCTF)[0-9]{0,3}\{[^}\r\n]{1,200}\}",
     re.IGNORECASE,
 )
 

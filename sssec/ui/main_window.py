@@ -80,7 +80,7 @@ def _model_label(provider) -> str:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SSsec · 授权安全测试 Agent")
+        self.setWindowTitle("SSsec")
         self.setWindowIcon(app_icon())
         self.setMinimumSize(1040, 680)
         screen = QGuiApplication.primaryScreen()
@@ -112,6 +112,12 @@ class MainWindow(QMainWindow):
         self._drafts: dict[str, str] = {}
         self._dirty = False
         self._closing = False
+        # 把高频 token 合并成固定 30fps 的 UI 刷新，避免每个 delta 都触发
+        # 一次 Markdown 排版和滚动。缓冲区需要在选择会话之前就存在。
+        self._text_buffer: list[str] = []
+        self._text_flush_timer = QTimer(self)
+        self._text_flush_timer.setInterval(33)
+        self._text_flush_timer.timeout.connect(self._flush_text)
 
         self._build_ui()
         self._connect_signals()
@@ -155,13 +161,13 @@ class MainWindow(QMainWindow):
 
         self.header = QFrame()
         self.header.setObjectName("ChatHeader")
-        self.header.setFixedHeight(76)
+        self.header.setFixedHeight(56)
         header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(27, 0, 22, 0)
-        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(24, 0, 18, 0)
+        header_layout.setSpacing(6)
 
         title_box = QVBoxLayout()
-        title_box.setSpacing(3)
+        title_box.setSpacing(0)
         self.title_label = ElidedLabel("SSsec")
         self.title_label.setObjectName("PageTitle")
         self.subtitle_label = QLabel("授权安全测试工作台")
@@ -169,33 +175,35 @@ class MainWindow(QMainWindow):
         title_box.addWidget(self.title_label)
         title_box.addWidget(self.subtitle_label)
         header_layout.addLayout(title_box, 1)
+        header_layout.addSpacing(10)
 
         self.access_header = QPushButton("完全权限")
         self.access_header.setObjectName("Chip")
         self.access_header.setCursor(Qt.PointingHandCursor)
-        self.access_header.setIcon(icon("bolt", COLORS["muted"], 14))
-        self.access_header.setIconSize(QSize(14, 14))
+        self.access_header.setIcon(icon("bolt", COLORS["muted"], 13))
+        self.access_header.setIconSize(QSize(13, 13))
         self.access_header.clicked.connect(self.toggle_full_permission)
         header_layout.addWidget(self.access_header)
 
         self.scope_header = QPushButton("设置测试目标")
         self.scope_header.setObjectName("Chip")
         self.scope_header.setCursor(Qt.PointingHandCursor)
-        self.scope_header.setIcon(icon("target", COLORS["muted"], 14))
-        self.scope_header.setIconSize(QSize(14, 14))
+        self.scope_header.setIcon(icon("target", COLORS["muted"], 13))
+        self.scope_header.setIconSize(QSize(13, 13))
         header_layout.addWidget(self.scope_header)
 
         self.findings_button = QPushButton("发现")
         self.findings_button.setObjectName("Chip")
         self.findings_button.setCursor(Qt.PointingHandCursor)
-        self.findings_button.setIcon(icon("file", COLORS["muted"], 14))
-        self.findings_button.setIconSize(QSize(14, 14))
+        self.findings_button.setIcon(icon("file", COLORS["muted"], 13))
+        self.findings_button.setIconSize(QSize(13, 13))
         header_layout.addWidget(self.findings_button)
 
+        header_layout.addSpacing(2)
         self.more_button = QToolButton()
         self.more_button.setObjectName("IconButton")
-        self.more_button.setIcon(icon("more", COLORS["muted"], 18))
-        self.more_button.setFixedSize(34, 34)
+        self.more_button.setIcon(icon("more", COLORS["muted"], 16))
+        self.more_button.setFixedSize(28, 28)
         self.more_button.setCursor(Qt.PointingHandCursor)
         self.more_button.setToolTip("更多操作")
         self.more_button.clicked.connect(self._open_more_menu)
@@ -207,11 +215,11 @@ class MainWindow(QMainWindow):
 
         self.approval_host = QWidget()
         approval_layout = QHBoxLayout(self.approval_host)
-        approval_layout.setContentsMargins(26, 8, 26, 0)
+        approval_layout.setContentsMargins(32, 8, 32, 0)
         approval_layout.setSpacing(0)
         approval_layout.addStretch(1)
         self.approval_bar = ApprovalBar()
-        self.approval_bar.setMaximumWidth(920)
+        self.approval_bar.setMaximumWidth(780)
         approval_layout.addWidget(self.approval_bar, 20)
         approval_layout.addStretch(1)
         self.approval_host.setVisible(False)
@@ -281,7 +289,11 @@ class MainWindow(QMainWindow):
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark)
             )
-            for attribute, color_key in ((35, "bg"), (36, "border")):
+            for attribute, color_key in (
+                (35, "pane"),      # DWMWA_CAPTION_COLOR
+                (34, "border"),    # DWMWA_BORDER_COLOR
+                (36, "heading"),   # DWMWA_TEXT_COLOR
+            ):
                 try:
                     color = QColor(COLORS[color_key])
                     value = ctypes.c_int(
@@ -405,7 +417,7 @@ class MainWindow(QMainWindow):
         )
         self.scope_header.setText(display)
         self.scope_header.setIcon(
-            icon("target", COLORS["accent_text"] if has_scope else COLORS["muted"], 14)
+            icon("target", COLORS["accent_text"] if has_scope else COLORS["muted"], 13)
         )
         set_dynamic_property(self.scope_header, "ok", "true" if has_scope else "false")
         set_dynamic_property(self.scope_header, "warn", "false")
@@ -421,7 +433,7 @@ class MainWindow(QMainWindow):
         full_access = bool(conversation.full_permission)
         self.access_header.setText("完全权限 · 开" if full_access else "完全权限")
         self.access_header.setIcon(
-            icon("bolt", COLORS["red"] if full_access else COLORS["muted"], 14)
+            icon("bolt", COLORS["red"] if full_access else COLORS["muted"], 13)
         )
         set_dynamic_property(
             self.access_header, "danger", "true" if full_access else "false"
@@ -435,6 +447,9 @@ class MainWindow(QMainWindow):
         )
         count = len(conversation.findings)
         self.findings_button.setText(f"发现 {count}" if count else "发现")
+        set_dynamic_property(self.findings_button, "ok", "true" if count else "false")
+        set_dynamic_property(self.findings_button, "warn", "false")
+        set_dynamic_property(self.findings_button, "danger", "false")
         self.findings_button.setToolTip(
             f"查看本对话的 {count} 条测试发现" if count else "查看测试发现"
         )
@@ -489,6 +504,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         if conversation_id == self.current_id and self.current_conversation is not None:
             return
+        self._flush_text()
         conversation = self.conversations.get(conversation_id)
         if conversation is None:
             return
@@ -783,9 +799,8 @@ class MainWindow(QMainWindow):
         model_label = _model_label(provider)
         assistant = conversation.add_assistant(model_label)
         self._save_conversation(conversation)
-        self.chat_view.set_conversation(
-            conversation, demo_mode=provider.type == "demo"
-        )
+        self.chat_view.append_message(user_message)
+        self.chat_view.append_message(assistant)
         self.composer.clear()
         self._refresh_header()
         self._refresh_sidebar()
@@ -809,6 +824,8 @@ class MainWindow(QMainWindow):
         self.active_run = active
         self.pending_approval = None
         self._pending_conversation_id = None
+        self._text_buffer.clear()
+        self._text_flush_timer.start()
         worker = AgentWorker(
             conversation_id=conversation.id,
             history=history,
@@ -852,6 +869,19 @@ class MainWindow(QMainWindow):
         message = conversation.message_by_id(str(self.active_run.get("assistant_id")))
         return message if isinstance(message, dict) else None
 
+    def _flush_text(self) -> None:
+        if not self._text_buffer:
+            return
+        text = "".join(self._text_buffer)
+        self._text_buffer.clear()
+        if not self.active_run or not text:
+            return
+        if self.current_id != self.active_run.get("conversation_id"):
+            return
+        self.chat_view.append_delta(
+            str(self.active_run.get("assistant_id") or ""), "text", text
+        )
+
     def _on_text_delta(self, text: str) -> None:
         if not text:
             return
@@ -860,8 +890,9 @@ class MainWindow(QMainWindow):
             return
         append_text(message, text, "text")
         self._dirty = True
-        if self.current_id == self.active_run.get("conversation_id"):
-            self.chat_view.append_delta(str(message["id"]), "text", text)
+        # UI 侧先缓存，由 33ms 定时器统一刷新；数据模型仍逐 token 更新，
+        # 所以复制、保存和运行结束后的最终内容都不受影响。
+        self._text_buffer.append(text)
 
     def _on_reasoning_delta(self, text: str) -> None:
         if not text:
@@ -883,6 +914,7 @@ class MainWindow(QMainWindow):
         self._dirty = True
 
     def _on_tool_started(self, payload: dict) -> None:
+        self._flush_text()
         message = self._assistant_message()
         if message is None:
             return
@@ -900,9 +932,9 @@ class MainWindow(QMainWindow):
         self._dirty = True
         if self.current_id == self.active_run.get("conversation_id"):
             self.chat_view.refresh_message(message)
-        self._save_conversation(self._run_conversation())
 
     def _on_tool_finished(self, payload: dict) -> None:
+        self._flush_text()
         message = self._assistant_message()
         if message is None:
             return
@@ -921,9 +953,9 @@ class MainWindow(QMainWindow):
         self._dirty = True
         if self.current_id == self.active_run.get("conversation_id"):
             self.chat_view.refresh_message(message)
-        self._save_conversation(self._run_conversation())
 
     def _on_approval_required(self, payload: dict) -> None:
+        self._flush_text()
         message = self._assistant_message()
         if message is None:
             return
@@ -980,6 +1012,8 @@ class MainWindow(QMainWindow):
     def _on_run_finished(self, status: str, error: str) -> None:
         if not self.active_run:
             return
+        self._flush_text()
+        self._text_flush_timer.stop()
         conversation = self._run_conversation()
         assistant = self._assistant_message()
         run_conversation_id = str(self.active_run.get("conversation_id") or "")
@@ -1029,9 +1063,10 @@ class MainWindow(QMainWindow):
         self._active_worker = None
         self._dirty = False
         if self.current_id == run_conversation_id and self.current_conversation:
-            self.chat_view.set_conversation(
-                self.current_conversation, demo_mode=self._provider().type == "demo"
-            )
+            if assistant is not None:
+                # 只更新最后一条助手消息并完成最终 Markdown 渲染，
+                # 不再重建整个聊天历史。
+                self.chat_view.refresh_message(assistant)
             self._refresh_current_view()
             self.composer.focus_input()
         else:
@@ -1079,6 +1114,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._closing = True
+        self._text_flush_timer.stop()
         if self._active_worker is not None:
             self._stop_for_close()
         if self.current_id:
@@ -1095,6 +1131,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def _stop_for_close(self) -> None:
+        self._text_flush_timer.stop()
         worker = self._active_worker
         if worker is None:
             return

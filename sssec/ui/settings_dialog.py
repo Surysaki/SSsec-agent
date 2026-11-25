@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
 
 from sssec.agent.llm import friendly_error, test_provider, validate_provider
 from sssec.agent.llm import ModelConfigError
+from sssec.skills import SkillStore
+from sssec.ui.skills_page import SkillsPage
 from sssec.config import (
     APP_VERSION,
     APPROVAL_MODES,
@@ -47,7 +49,13 @@ from sssec.config import (
 )
 from sssec.ui.icons import icon
 from sssec.ui.theme import COLORS, THEMES as UI_THEMES
-from sssec.ui.widgets import BrandMark, ClickFrame, divider, set_dynamic_property
+from sssec.ui.widgets import (
+    BrandMark,
+    ClickFrame,
+    PageHeader,
+    divider,
+    set_dynamic_property,
+)
 
 
 class ThemeCard(ClickFrame):
@@ -57,10 +65,10 @@ class ThemeCard(ClickFrame):
         super().__init__()
         self.theme_name = theme_name
         self.setObjectName("ThemeCard")
-        self.setMinimumHeight(92)
+        self.setMinimumHeight(84)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(7)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
 
         top = QHBoxLayout()
         top.setSpacing(8)
@@ -70,20 +78,20 @@ class ThemeCard(ClickFrame):
         top.addWidget(title_label)
         top.addStretch(1)
         self.check = QLabel()
-        self.check.setPixmap(icon("check", COLORS["accent"], 15).pixmap(15, 15))
+        self.check.setPixmap(icon("check", COLORS["accent"], 14).pixmap(14, 14))
         self.check.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         top.addWidget(self.check)
         layout.addLayout(top)
 
         swatches = QHBoxLayout()
-        swatches.setSpacing(5)
+        swatches.setSpacing(4)
         palette = UI_THEMES[theme_name]
-        for key in ("bg", "sidebar", "surface_2", "accent", "text"):
+        for key in ("accent", "accent_2", "cyan", "violet", "green", "amber", "red"):
             swatch = QLabel()
-            swatch.setFixedSize(24, 12)
+            swatch.setFixedSize(18, 10)
             swatch.setStyleSheet(
-                f"background: {palette[key]}; border: 1px solid {palette['border']};"
-                "border-radius: 3px;"
+                f"background: {palette[key]}; border: 1px solid {palette['border_strong']};"
+                "border-radius: 2px;"
             )
             swatch.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             swatches.addWidget(swatch)
@@ -143,8 +151,8 @@ class SettingsDialog(QDialog):
         self.setObjectName("SettingsDialog")
         self.setWindowTitle("SSsec 设置")
         self.setModal(True)
-        self.resize(980, 710)
-        self.setMinimumSize(880, 620)
+        self.resize(1000, 720)
+        self.setMinimumSize(900, 640)
         self.settings = settings.clone()
         self.data_dir = data_dir
         self.result_settings: AppSettings | None = None
@@ -166,59 +174,63 @@ class SettingsDialog(QDialog):
 
         nav = QWidget()
         nav.setObjectName("SettingsNav")
-        nav.setFixedWidth(210)
+        nav.setFixedWidth(200)
         nav_layout = QVBoxLayout(nav)
-        nav_layout.setContentsMargins(16, 22, 16, 16)
-        nav_layout.setSpacing(12)
+        nav_layout.setContentsMargins(12, 16, 12, 12)
+        nav_layout.setSpacing(10)
         brand_row = QHBoxLayout()
-        brand_row.setSpacing(9)
-        brand_row.addWidget(BrandMark(30))
+        brand_row.setContentsMargins(4, 0, 0, 0)
+        brand_row.setSpacing(8)
+        brand_row.addWidget(BrandMark(24))
         brand_text = QVBoxLayout()
         brand_text.setSpacing(0)
         title = QLabel("设置")
         title.setObjectName("SettingsBrandTitle")
-        subtitle = QLabel("SSsec 工作台")
+        subtitle = QLabel("SSSEC WORKSPACE")
         subtitle.setObjectName("BrandSub")
         brand_text.addWidget(title)
         brand_text.addWidget(subtitle)
         brand_row.addLayout(brand_text, 1)
         nav_layout.addLayout(brand_row)
-        nav_layout.addSpacing(9)
+        nav_layout.addSpacing(8)
+        nav_caption = QLabel("偏好")
+        nav_caption.setObjectName("SectionCaption")
+        nav_caption.setContentsMargins(6, 0, 0, 0)
+        nav_layout.addWidget(nav_caption)
 
         self.nav_list = QListWidget()
         self.nav_list.setObjectName("SettingsNav")
         self.nav_list.setFocusPolicy(Qt.NoFocus)
-        for index, (text, icon_name) in enumerate(
-            [
-                ("模型服务", "spark"),
-                ("Agent 与安全", "shield"),
-                ("外观", "sun"),
-                ("数据与关于", "folder"),
-            ]
+        self._nav_icons = ["spark", "shield", "bolt", "sun", "folder"]
+        for text, icon_name in zip(
+            ["模型服务", "Agent 与安全", "技能库", "外观", "数据与关于"],
+            self._nav_icons,
         ):
-            item = QListWidgetItem(icon(icon_name, COLORS["muted"], 16), text)
-            item.setSizeHint(QSize(0, 40))
+            item = QListWidgetItem(icon(icon_name, COLORS["muted"], 15), text)
+            item.setSizeHint(QSize(0, 32))
             self.nav_list.addItem(item)
         self.nav_list.currentRowChanged.connect(self._on_nav_changed)
         nav_layout.addWidget(self.nav_list)
         nav_layout.addStretch(1)
         version = QLabel(f"SSsec v{APP_VERSION}\nLangGraph · PySide6")
         version.setObjectName("Faint")
+        version.setContentsMargins(6, 0, 0, 0)
         nav_layout.addWidget(version)
         body.addWidget(nav)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_models_page())
-        self.stack.addWidget(self._build_safety_page())
-        self.stack.addWidget(self._build_appearance_page())
-        self.stack.addWidget(self._build_data_page())
+        self.stack.addWidget(self._wrap_scroll(self._build_safety_page()))
+        self.stack.addWidget(self._build_skills_page())
+        self.stack.addWidget(self._wrap_scroll(self._build_appearance_page()))
+        self.stack.addWidget(self._wrap_scroll(self._build_data_page()))
         body.addWidget(self.stack, 1)
         root.addLayout(body, 1)
 
         footer = QFrame()
         footer.setObjectName("SettingsFooter")
         footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(22, 11, 22, 11)
+        footer_layout.setContentsMargins(18, 10, 18, 10)
         footer_layout.setSpacing(10)
         self.status_label = QLabel("")
         self.status_label.setObjectName("HelpText")
@@ -238,28 +250,38 @@ class SettingsDialog(QDialog):
         self._load_provider(self.settings.active_provider_id)
 
     # ================================================================ pages
+    def _wrap_scroll(self, page: QWidget) -> QScrollArea:
+        """把设置页放进滚动区，避免内容把对话框撑到超出小屏幕。"""
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(page)
+        return scroll
+
     def _build_models_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(26, 22, 26, 18)
+        layout.setContentsMargins(28, 22, 28, 18)
         layout.setSpacing(6)
-        title = QLabel("模型服务")
-        title.setObjectName("SettingsSection")
-        layout.addWidget(title)
-        subtitle = QLabel(
-            "支持 OpenAI 兼容接口（DeepSeek、Qwen、OpenRouter、Ollama、vLLM 等）"
-            "以及 Anthropic Claude。"
+        layout.addWidget(
+            PageHeader(
+                "spark",
+                "模型服务",
+                "支持 OpenAI 兼容接口（DeepSeek、Qwen、OpenRouter、Ollama、vLLM 等）"
+                "以及 Anthropic Claude。",
+                tone="accent",
+            )
         )
-        subtitle.setObjectName("PageSub")
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
         layout.addSpacing(12)
 
         content = QHBoxLayout()
         content.setSpacing(16)
 
         left = QWidget()
-        left.setFixedWidth(245)
+        left.setFixedWidth(232)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(7)
@@ -267,7 +289,7 @@ class SettingsDialog(QDialog):
         left_layout.addWidget(caption)
         self.provider_list = QListWidget()
         self.provider_list.setObjectName("ProviderList")
-        self.provider_list.setMinimumHeight(260)
+        self.provider_list.setMinimumHeight(250)
         self.provider_list.currentItemChanged.connect(self._on_provider_selected)
         left_layout.addWidget(self.provider_list, 1)
         buttons = QHBoxLayout()
@@ -413,20 +435,22 @@ class SettingsDialog(QDialog):
     def _build_safety_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(26, 22, 26, 18)
+        layout.setContentsMargins(28, 22, 28, 18)
         layout.setSpacing(6)
-        title = QLabel("Agent 与安全")
-        title.setObjectName("SettingsSection")
-        layout.addWidget(title)
-        subtitle = QLabel("这些设置会应用到之后启动的每一轮 Agent 运行。")
-        subtitle.setObjectName("PageSub")
-        layout.addWidget(subtitle)
+        layout.addWidget(
+            PageHeader(
+                "shield",
+                "Agent 与安全",
+                "这些设置会应用到之后启动的每一轮 Agent 运行。",
+                tone="green",
+            )
+        )
         layout.addSpacing(16)
 
         card = QFrame()
         card.setObjectName("Card")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setContentsMargins(14, 12, 14, 12)
         card_layout.setSpacing(8)
         approval_label = _field_label("工具审批策略")
         self.approval_combo = QComboBox()
@@ -470,14 +494,25 @@ class SettingsDialog(QDialog):
         limits = QFrame()
         limits.setObjectName("Card")
         limits_layout = QVBoxLayout(limits)
-        limits_layout.setContentsMargins(16, 14, 16, 14)
+        limits_layout.setContentsMargins(14, 12, 14, 12)
         limits_layout.setSpacing(10)
         caption = QLabel("运行限制")
         caption.setObjectName("FieldLabel")
         limits_layout.addWidget(caption)
 
         self.rounds_input = QSpinBox()
-        self.rounds_input.setRange(1, 20)
+        self.rounds_input.setRange(0, 500)
+        self.rounds_input.setSpecialValueText("不限制")
+        self.rounds_input.setToolTip(
+            "软预算：只用于提示词中的收敛建议，不会因为轮次到点而中止阶段。0 = 不给提示。"
+        )
+        self.hard_stop_input = QSpinBox()
+        self.hard_stop_input.setRange(0, 5000)
+        self.hard_stop_input.setSpecialValueText("关闭")
+        self.hard_stop_input.setSuffix(" 轮")
+        self.hard_stop_input.setToolTip(
+            "安全熔断：模型持续空转时的兜底上限。正常任务不应触达，0 = 关闭。"
+        )
         self.command_timeout_input = QSpinBox()
         self.command_timeout_input.setRange(5, 600)
         self.command_timeout_input.setSuffix(" 秒")
@@ -485,12 +520,13 @@ class SettingsDialog(QDialog):
         self.network_timeout_input.setRange(3, 120)
         self.network_timeout_input.setSuffix(" 秒")
         self.history_input = QSpinBox()
-        self.history_input.setRange(4, 120)
+        self.history_input.setRange(4, 400)
         self.history_input.setSuffix(" 条")
         rows = QHBoxLayout()
         rows.setSpacing(14)
         for label, widget in [
-            ("最大工具轮次", self.rounds_input),
+            ("软轮次提示", self.rounds_input),
+            ("安全熔断", self.hard_stop_input),
             ("命令超时", self.command_timeout_input),
             ("网络超时", self.network_timeout_input),
             ("历史消息上限", self.history_input),
@@ -501,8 +537,54 @@ class SettingsDialog(QDialog):
             column.addWidget(widget)
             rows.addLayout(column)
         limits_layout.addLayout(rows)
+
+        self.auto_continue = QCheckBox("目标未达成时自动续跑（同一轮对话内继续）")
+        self.auto_continue.setChecked(True)
+        limits_layout.addWidget(self.auto_continue)
+        auto_row = QHBoxLayout()
+        auto_row.setSpacing(14)
+        self.max_auto_continue_input = QSpinBox()
+        self.max_auto_continue_input.setRange(0, 50)
+        self.max_auto_continue_input.setSpecialValueText("不限制")
+        self.max_auto_continue_input.setSuffix(" 次")
+        self.brake_input = QSpinBox()
+        self.brake_input.setRange(0, 1440)
+        self.brake_input.setSpecialValueText("关闭")
+        self.brake_input.setSuffix(" 分钟")
+        for label, widget in [
+            ("自动续跑上限", self.max_auto_continue_input),
+            ("运行熔断", self.brake_input),
+        ]:
+            column = QVBoxLayout()
+            column.setSpacing(4)
+            column.addWidget(_field_label(label))
+            column.addWidget(widget)
+            auto_row.addLayout(column)
+        auto_row.addStretch(1)
+        limits_layout.addLayout(auto_row)
+
+        self.skills_enabled = QCheckBox("启用技能库（skill_list / skill_load / skill_unload）")
+        self.skills_enabled.setChecked(True)
+        limits_layout.addWidget(self.skills_enabled)
+        skill_row = QHBoxLayout()
+        skill_row.setSpacing(14)
+        self.skill_max_input = QSpinBox()
+        self.skill_max_input.setRange(1, 3)
+        self.skill_max_input.setSuffix(" 张")
+        for label, widget in [("每阶段技能上限", self.skill_max_input)]:
+            column = QVBoxLayout()
+            column.setSpacing(4)
+            column.addWidget(_field_label(label))
+            column.addWidget(widget)
+            skill_row.addLayout(column)
+        skill_row.addStretch(1)
+        limits_layout.addLayout(skill_row)
         limits_layout.addWidget(
-            _help_label("限制用于控制上下文和资源消耗。超过工具轮次时本轮会被安全中止。")
+            _help_label(
+                "v0.2.1 起轮次不再作为收尾理由：阶段可以连续调用工具直到目标达成；"
+                "软轮次只影响提示，安全熔断与运行熔断是模型或任务失控时的兜底。"
+                "技能库按需加载，每阶段有上限，可用 skill_unload 换卡。"
+            )
         )
         layout.addWidget(limits)
         layout.addSpacing(12)
@@ -527,40 +609,44 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return page
 
+    def _build_skills_page(self) -> QWidget:
+        self.skills_page = SkillsPage(SkillStore(self.data_dir))
+        return self.skills_page
+
     def _build_appearance_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(26, 22, 26, 18)
+        layout.setContentsMargins(28, 22, 28, 18)
         layout.setSpacing(6)
-        title = QLabel("外观")
-        title.setObjectName("SettingsSection")
-        layout.addWidget(title)
-        subtitle = QLabel(
-            "选择界面主题。默认使用以白色为主的浅色主题，也可以随时在左下角快速切换。"
+        layout.addWidget(
+            PageHeader(
+                "sun",
+                "外观",
+                "整套界面遵循 Linear 设计语言：近中性底色、1px 细边框、靛蓝强调色"
+                "与紧凑排版；也可以随时在左下角快速切换。",
+                tone="violet",
+            )
         )
-        subtitle.setObjectName("PageSub")
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
         layout.addSpacing(16)
 
         card = QFrame()
         card.setObjectName("Card")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 14, 16, 14)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(8)
         caption = QLabel("界面主题")
         caption.setObjectName("FieldLabel")
         card_layout.addWidget(caption)
         for name, title_text, description in (
             (
                 "light",
-                "浅色 · 白色主题（默认）",
-                "白色卡片、浅灰背景与青绿色强调色，适合长时间阅读与日常办公。",
+                "浅色 · Linear Light（默认）",
+                "白色画布、浅灰侧栏与靛蓝强调色，适合白天与长时间阅读。",
             ),
             (
                 "dark",
-                "深色 · 安全测试工作台",
-                "深蓝背景与高对比强调色，适合夜间和演示场景。",
+                "深色 · Linear Dark",
+                "近黑画布、微弱抬升的表面与低饱和文字，适合夜间与安全测试工作台。",
             ),
         ):
             theme_card = ThemeCard(name, title_text, description)
@@ -580,15 +666,15 @@ class SettingsDialog(QDialog):
         preview = QFrame()
         preview.setObjectName("Card")
         preview_layout = QVBoxLayout(preview)
-        preview_layout.setContentsMargins(16, 14, 16, 14)
+        preview_layout.setContentsMargins(14, 12, 14, 12)
         preview_layout.setSpacing(8)
         preview_caption = QLabel("设计说明")
         preview_caption.setObjectName("FieldLabel")
         preview_layout.addWidget(preview_caption)
         preview_layout.addWidget(
             _help_label(
-                "两套主题共用同一套语义色板（背景、表面、边框、强调色、状态色），"
-                "切换时图标、Markdown 渲染、工具卡片、审批条和设置页会同步更新。"
+                "两套主题共用同一套语义色板（画布、表面、边框、强调色、状态色）与同一套间距、"
+                "圆角规则；切换时图标、Markdown、工具卡片、审批条与设置页会同步更新。"
             )
         )
         layout.addWidget(preview)
@@ -608,21 +694,22 @@ class SettingsDialog(QDialog):
     def _build_data_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(26, 22, 26, 18)
+        layout.setContentsMargins(28, 22, 28, 18)
         layout.setSpacing(6)
-        title = QLabel("数据与关于")
-        title.setObjectName("SettingsSection")
-        layout.addWidget(title)
-        subtitle = QLabel("所有会话、审计日志和密钥都保存在本机，不会上传到 SSsec 服务器。")
-        subtitle.setObjectName("PageSub")
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
+        layout.addWidget(
+            PageHeader(
+                "folder",
+                "数据与关于",
+                "所有会话、审计日志和密钥都保存在本机，不会上传到 SSsec 服务器。",
+                tone="blue",
+            )
+        )
         layout.addSpacing(16)
 
         card = QFrame()
         card.setObjectName("Card")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setContentsMargins(14, 12, 14, 12)
         card_layout.setSpacing(8)
         caption = QLabel("本地数据目录")
         caption.setObjectName("FieldLabel")
@@ -631,6 +718,7 @@ class SettingsDialog(QDialog):
         path_label.setObjectName("PathBox")
         path_label.setWordWrap(True)
         path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.path_label = path_label
         card_layout.addWidget(path_label)
         button_row = QHBoxLayout()
         open_button = QPushButton("打开数据目录")
@@ -662,7 +750,7 @@ class SettingsDialog(QDialog):
         security = QFrame()
         security.setObjectName("Card")
         security_layout = QVBoxLayout(security)
-        security_layout.setContentsMargins(16, 14, 16, 14)
+        security_layout.setContentsMargins(14, 12, 14, 12)
         security_layout.setSpacing(7)
         security_caption = QLabel("本地密钥保护")
         security_caption.setObjectName("FieldLabel")
@@ -682,7 +770,7 @@ class SettingsDialog(QDialog):
         about = QFrame()
         about.setObjectName("Card")
         about_layout = QHBoxLayout(about)
-        about_layout.setContentsMargins(16, 14, 16, 14)
+        about_layout.setContentsMargins(14, 12, 14, 12)
         about_layout.setSpacing(12)
         about_layout.addWidget(BrandMark(40), 0, Qt.AlignTop)
         about_text = QVBoxLayout()
@@ -691,7 +779,7 @@ class SettingsDialog(QDialog):
         about_title.setObjectName("SettingsEditorTitle")
         about_text.addWidget(about_title)
         desc = QLabel(
-            "本地优先的安全测试 Agent Harness，默认白色主题、可切换深色。"
+            "本地优先的安全测试 Agent Harness，Linear 风格浅色 / 深色双主题。"
             "多 Agent 运行时：LangGraph 指挥官 + 阶段子图；桌面界面：PySide6。"
         )
         desc.setObjectName("HelpText")
@@ -724,6 +812,16 @@ class SettingsDialog(QDialog):
         if self._last_nav_row == 0 and row != 0:
             self._stash_current_provider()
         self._last_nav_row = row
+        for index, icon_name in enumerate(self._nav_icons):
+            item = self.nav_list.item(index)
+            if item is not None:
+                item.setIcon(
+                    icon(
+                        icon_name,
+                        COLORS["accent_text"] if index == row else COLORS["muted"],
+                        15,
+                    )
+                )
         self.stack.setCurrentIndex(row)
 
     def _load_provider(self, provider_id: str) -> None:
@@ -751,22 +849,26 @@ class SettingsDialog(QDialog):
         self.provider_list.clear()
         target_row = 0
         for index, provider in enumerate(self.settings.providers):
-            marker = "●  " if provider.id == self.settings.active_provider_id else "    "
-            label = f"{marker}{provider.name}"
+            is_active = provider.id == self.settings.active_provider_id
+            label = provider.name
             detail = f"{provider.type_label} · {provider.model or '未填写模型'}"
             item = QListWidgetItem(
                 icon(
                     "spark" if provider.type != "anthropic" else "lock",
-                    COLORS["accent_text"]
-                    if provider.id == self.settings.active_provider_id
-                    else COLORS["muted"],
+                    COLORS["accent_text"] if is_active else COLORS["muted"],
                     15,
                 ),
                 label,
             )
+            if is_active:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
             item.setData(Qt.UserRole, provider.id)
-            item.setToolTip(f"{provider.name}\n{detail}")
-            item.setSizeHint(QSize(0, 38))
+            item.setToolTip(
+                f"{provider.name}\n{detail}" + ("\n当前模型" if is_active else "")
+            )
+            item.setSizeHint(QSize(0, 34))
             self.provider_list.addItem(item)
             if provider.id == (select_id or self._editing_provider_id):
                 target_row = index
@@ -965,6 +1067,12 @@ class SettingsDialog(QDialog):
             scope_mode=str(self.scope_combo.currentData() or "off"),
             enable_shell=self.enable_shell.isChecked(),
             max_tool_rounds=self.rounds_input.value(),
+            hard_stop_rounds=self.hard_stop_input.value(),
+            auto_continue=self.auto_continue.isChecked(),
+            max_auto_continue=self.max_auto_continue_input.value(),
+            brake_minutes=self.brake_input.value(),
+            skills_enabled=self.skills_enabled.isChecked(),
+            skill_max_loaded=self.skill_max_input.value(),
             command_timeout=self.command_timeout_input.value(),
             network_timeout=self.network_timeout_input.value(),
             max_history_messages=self.history_input.value(),
@@ -1005,6 +1113,12 @@ class SettingsDialog(QDialog):
         self.scope_combo.setCurrentIndex(scope_index if scope_index >= 0 else 0)
         self.enable_shell.setChecked(safety.enable_shell)
         self.rounds_input.setValue(safety.max_tool_rounds)
+        self.hard_stop_input.setValue(safety.hard_stop_rounds)
+        self.auto_continue.setChecked(safety.auto_continue)
+        self.max_auto_continue_input.setValue(safety.max_auto_continue)
+        self.skills_enabled.setChecked(safety.skills_enabled)
+        self.skill_max_input.setValue(safety.skill_max_loaded)
+        self.brake_input.setValue(safety.brake_minutes)
         self.command_timeout_input.setValue(safety.command_timeout)
         self.network_timeout_input.setValue(safety.network_timeout)
         self.history_input.setValue(safety.max_history_messages)

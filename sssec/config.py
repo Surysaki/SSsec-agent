@@ -18,7 +18,7 @@ from sssec.security.secrets import (
     unprotect_secret,
 )
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 CONFIG_SCHEMA = 2
 
 PROVIDER_TYPES = {
@@ -42,8 +42,8 @@ SCOPE_MODES = {
 }
 
 THEMES = {
-    "light": "浅色（白色主题）",
-    "dark": "深色（安全测试工作台）",
+    "light": "浅色（Linear Light）",
+    "dark": "深色（Linear Dark）",
 }
 DEFAULT_THEME = "light"
 
@@ -159,10 +159,25 @@ class SafetySettings:
     approval_mode: str = "relaxed"
     scope_mode: str = "off"
     enable_shell: bool = True
-    max_tool_rounds: int = 12
+    # 软预算：只用于提示词里的收敛建议与界面进度，不再硬截断阶段。
+    max_tool_rounds: int = 60
+    # 安全熔断：单个阶段一次派发超过该轮次才强制中止；0 = 关闭。
+    hard_stop_rounds: int = 400
+    # 目标未达成时是否在同一轮对话内自动续跑。
+    auto_continue: bool = True
+    # 自动续跑上限；0 = 不限制（仍受 brake_minutes 约束）。
+    max_auto_continue: int = 3
+    # 相同动作重复多少次判定为空转循环。
+    loop_guard: int = 3
+    # 单次运行熔断（分钟）；0 = 关闭。
+    brake_minutes: int = 0
+    # 技能库：启用后 worker 可按需 skill_list / skill_load。
+    skills_enabled: bool = True
+    # 单个阶段最多加载几张技能卡。
+    skill_max_loaded: int = 2
     command_timeout: int = 60
     network_timeout: int = 20
-    max_history_messages: int = 60
+    max_history_messages: int = 80
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -176,16 +191,32 @@ class SafetySettings:
         scope_mode = str(data.get("scope_mode", "off"))
         if scope_mode not in SCOPE_MODES:
             scope_mode = "off"
+
+        def _int(key: str, default: int, low: int, high: int) -> int:
+            raw = data.get(key, default)
+            if raw is None or raw == "":
+                raw = default
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = default
+            return max(low, min(high, value))
+
         return cls(
             approval_mode=approval_mode,
             scope_mode=scope_mode,
             enable_shell=bool(data.get("enable_shell", True)),
-            max_tool_rounds=max(1, min(20, int(data.get("max_tool_rounds", 12) or 12))),
-            command_timeout=max(5, min(600, int(data.get("command_timeout", 60) or 60))),
-            network_timeout=max(3, min(120, int(data.get("network_timeout", 20) or 20))),
-            max_history_messages=max(
-                4, min(120, int(data.get("max_history_messages", 60) or 60))
-            ),
+            max_tool_rounds=_int("max_tool_rounds", 60, 0, 1000),
+            hard_stop_rounds=_int("hard_stop_rounds", 400, 0, 5000),
+            auto_continue=bool(data.get("auto_continue", True)),
+            max_auto_continue=_int("max_auto_continue", 3, 0, 50),
+            loop_guard=_int("loop_guard", 3, 1, 10),
+            brake_minutes=_int("brake_minutes", 0, 0, 1440),
+            skills_enabled=bool(data.get("skills_enabled", True)),
+            skill_max_loaded=_int("skill_max_loaded", 2, 1, 3),
+            command_timeout=_int("command_timeout", 60, 5, 600),
+            network_timeout=_int("network_timeout", 20, 3, 120),
+            max_history_messages=_int("max_history_messages", 80, 4, 400),
         )
 
 

@@ -42,11 +42,18 @@ WORKER_DESCRIPTIONS: dict[str, str] = {
     "final": "汇总前面所有证据、重新建模并做最后突破的全工具 Agent",
 }
 
-# 允许 handoff 的目标：四个阶段 + 逆向专项 + 收尾。
-HANDOFF_TARGETS: tuple[str, ...] = (*WORKER_ORDER, "reverse", "finish")
+# 允许 handoff 的目标：四个阶段 + 逆向专项 + 最终突破 + 收尾。
+HANDOFF_TARGETS: tuple[str, ...] = (*WORKER_ORDER, "reverse", "final", "finish")
 
-# 指挥官最多调度多少轮，防止弱模型陷入循环。
+# 指挥官调度软预算：超过后进入“策略复盘”，但不再强制收尾。
 MAX_TEAM_STEPS = 16
+# 指挥官调度硬熔断：只在模型持续空转时兜底，正常任务不应触达。
+MAX_TEAM_STEPS_HARD = 200
+
+# 单个阶段一次派发内允许的“空转续跑”次数（模型没调用任何工具就想收尾）。
+MAX_WORKER_CONTINUATIONS = 1
+# 循环检测触发后，最多提示几次换策略；超过后中止该阶段。
+MAX_LOOP_HINTS = 1
 
 
 class PentestState(TypedDict, total=False):
@@ -80,10 +87,38 @@ class PentestState(TypedDict, total=False):
     finished: bool
     finish_summary: str
 
+    # --- v0.2.1：目标驱动调度 -------------------------------------------------
+    # 本次阶段派发内已经发生的工具调用数（用于识别“零工具空转阶段”）。
+    worker_tool_calls: int
+    # 本阶段“空转续跑”次数。
+    deepen_count: int
+    # 最近若干轮的调用签名，用于循环检测。
+    action_history: list[str]
+    # 连续相同签名的次数。
+    loop_streak: int
+    # 已发出的“换策略”提示次数。
+    loop_hint: int
+    # 阶段被循环检测/熔断中止。
+    stalled: bool
+    # 阶段报告读取消息的游标，保证 report 只统计本轮新增消息。
+    report_cursor: int
+    # 无进展升级次数（换阶段/换路线），超过阈值才允许 blocked 收尾。
+    escalations: int
+    # 任务目标快照（跨轮恢复时使用）。
+    mission_objective: str
+    # 自动续跑次数。
+    auto_continue: int
+    # 本阶段已加载的技能卡 id（每阶段重置）与证据冲突记录。
+    loaded_skills: list[str]
+    skill_conflicts: list[dict[str, Any]]
+
 
 __all__ = [
     "HANDOFF_TARGETS",
+    "MAX_LOOP_HINTS",
     "MAX_TEAM_STEPS",
+    "MAX_TEAM_STEPS_HARD",
+    "MAX_WORKER_CONTINUATIONS",
     "PentestState",
     "WORKER_DESCRIPTIONS",
     "WORKER_LABELS",

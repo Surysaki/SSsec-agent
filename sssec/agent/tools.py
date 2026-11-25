@@ -888,11 +888,18 @@ def _build_tool_definitions(
     mapping.update(build_recon_tools(ctx))
     mapping.update(build_web_tools(ctx))
     mapping.update(build_ctf_tools(ctx))
+    if ctx.settings.safety.skills_enabled:
+        mapping.update(build_skill_tools(ctx))
     if ctx.settings.safety.enable_shell:
         mapping["run_command"] = run_command
     if names is None:
         return list(mapping.values())
-    return [mapping[name] for name in names if name in mapping]
+    selected = [mapping[name] for name in names if name in mapping]
+    # 技能工具对所有阶段可用，但不占用各阶段的工具白名单。
+    for extra in ("skill_list", "skill_load", "skill_unload"):
+        if extra in mapping and extra not in names:
+            selected.append(mapping[extra])
+    return selected
 
 
 @tool("handoff")
@@ -924,6 +931,82 @@ def handoff(
             "summary": str(summary or "").strip()[:4000],
         }
     )
+
+
+def build_skill_tools(ctx: AgentContext) -> dict[str, BaseTool]:
+    """技能库工具：列出索引、按需加载一张参考卡。
+
+    技能是“参考”，不是真相；与工具证据冲突时以证据为准。
+    """
+
+    @tool("skill_list")
+    def skill_list() -> str:
+        """列出当前可用的技能卡（id、名称、分类、触发条件、适用阶段）。"""
+        if not ctx.settings.safety.skills_enabled:
+            return _err("技能库已关闭")
+        store = ctx.skill_store()
+        skills = store.list()
+        return _ok(
+            {
+                "skills": [
+                    {
+                        "id": item.id,
+                        "name": item.name,
+                        "category": item.category,
+                        "when": item.when,
+                        "stages": list(item.stages),
+                    }
+                    for item in skills
+                ],
+                "count": len(skills),
+                "categories": store.categories(),
+            }
+        )
+
+    @tool("skill_load")
+    def skill_load(skill_id: str) -> str:
+        """按 id 加载一张技能参考卡（每阶段有上限，正文不超过约 6000 字符）。"""
+        if not ctx.settings.safety.skills_enabled:
+            return _err("技能库已关闭")
+        store = ctx.skill_store()
+        skill = store.get(skill_id)
+        if skill is None or not skill.enabled:
+            return _err(
+                f"技能不存在或未启用：{skill_id}",
+                available=[item.id for item in store.list()],
+            )
+        body = store.body_for(skill.id)
+        return _ok(
+            {
+                "skill": {
+                    "id": skill.id,
+                    "name": skill.name,
+                    "category": skill.category,
+                    "when": skill.when,
+                    "stages": list(skill.stages),
+                    "source": skill.source,
+                    "license": skill.license,
+                    "body": body,
+                },
+                "note": (
+                    "技能是参考，不是真相：与工具结果冲突时以工具证据为准，"
+                    "并记录冲突点；名额满时可先 skill_unload 再加载。"
+                ),
+            }
+        )
+
+    @tool("skill_unload")
+    def skill_unload(skill_id: str) -> str:
+        """卸载一张已加载的技能卡，释放本阶段名额。"""
+        if not ctx.settings.safety.skills_enabled:
+            return _err("技能库已关闭")
+        return _ok({"skill_id": str(skill_id or "").strip(), "unloaded": True})
+
+    return {
+        "skill_list": skill_list,
+        "skill_load": skill_load,
+        "skill_unload": skill_unload,
+    }
 
 
 def build_tools(

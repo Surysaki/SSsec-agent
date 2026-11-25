@@ -143,6 +143,15 @@ def _compile_team(
         name: compile_worker(ctx, WORKER_SPECS[name], base_model)
         for name in WORKER_SPECS
     }
+    # v0.2.1：把“最终突破”接进调度图。前面阶段反复卡住时，指挥官可以直接
+    # 升级到拥有全部工具的 final Agent，而不是收尾。
+    final_spec = WorkerSpec(
+        name="final",
+        label=WORKER_LABELS["final"],
+        tool_names=tuple(tool.name for tool in build_tools(ctx)),
+        max_rounds=20,
+    )
+    worker_graphs["final"] = compile_worker(ctx, final_spec, base_model)
 
     async def commander(state: PentestState) -> dict[str, Any]:
         return await commander_node(ctx, base_model, state)
@@ -151,13 +160,19 @@ def _compile_team(
         worker = str(state.get("next_agent") or "unknown")
         label = WORKER_LABELS.get(worker, worker)
         messages = state.get("messages") or []
-        summary = _last_ai_text(messages)
+        # v0.2.1：只统计本次派发新增的消息，避免阶段被中止时把上一阶段的
+        # 收尾文本误当成这一阶段的报告（这正是 v0.2.0 “假无进展”的根因）。
+        cursor = max(0, int(state.get("report_cursor") or 0))
+        if cursor > len(messages):
+            cursor = 0
+        fresh = messages[cursor:]
+        summary = _last_ai_text(fresh)
         recent = [
             {
                 "type": getattr(item, "type", type(item).__name__),
                 "content": extract_text(getattr(item, "content", ""))[:400],
             }
-            for item in messages[-6:]
+            for item in fresh[-6:]
         ]
         evidence = [
             {
@@ -165,12 +180,17 @@ def _compile_team(
                 "status": str(getattr(item, "status", "") or ""),
                 "content": extract_text(getattr(item, "content", ""))[:600],
             }
-            for item in messages
+            for item in fresh
             if isinstance(item, ToolMessage)
         ][-8:]
-        fingerprint = hashlib.sha1(
-            json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest() if evidence else hashlib.sha1(summary.encode("utf-8")).hexdigest()
+        if evidence:
+            fingerprint = hashlib.sha1(
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        elif summary.strip():
+            fingerprint = hashlib.sha1(summary.encode("utf-8")).hexdigest()
+        else:
+            fingerprint = ""
         entry = {
             "worker": worker,
             "label": label,
@@ -180,6 +200,12 @@ def _compile_team(
             "recent": recent,
             "evidence": evidence,
             "progress_key": fingerprint,
+            # 没有文本、没有工具证据，说明这个阶段被中止或模型空转；
+            # 这类报告不能拿来判定“没有新进展”。
+            "truncated": not summary.strip() and not evidence,
+            "stalled": bool(state.get("stalled")),
+            "skills": list(state.get("loaded_skills") or []),
+            "rounds": int((state.get("worker_rounds_total") or {}).get(worker, 0)),
             "created_at": now_iso(),
         }
         ctx.audit.write(
@@ -190,8 +216,14 @@ def _compile_team(
             handoff=entry["handoff"],
             evidence_count=len(evidence),
             progress_key=fingerprint,
+            truncated=entry["truncated"],
+            stalled=entry["stalled"],
+            skills=entry["skills"],
         )
-        return {"worker_reports": [*(state.get("worker_reports") or []), entry]}
+        return {
+            "worker_reports": [*(state.get("worker_reports") or []), entry],
+            "report_cursor": len(messages),
+        }
 
     def finalize(state: PentestState) -> dict[str, Any]:
         summary = str(state.get("finish_summary") or "").strip()

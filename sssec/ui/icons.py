@@ -85,6 +85,62 @@ _PATHS: dict[str, str] = {
     ),
     "moon": '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
     "bolt": '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
+    # ---- Linear 风格补充图标 ----
+    "command": (
+        '<path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 0 0 0-6z"/>'
+    ),
+    "panel_left": (
+        '<rect x="3" y="3" width="18" height="18" rx="3"/>'
+        '<path d="M9.5 3v18"/>'
+    ),
+    "layers": (
+        '<path d="M12 2l9 5-9 5-9-5 9-5z"/>'
+        '<path d="M3 12l9 5 9-5"/>'
+        '<path d="M3 17l9 5 9-5"/>'
+    ),
+    "inbox": (
+        '<path d="M3 13h4l2 3h6l2-3h4"/>'
+        '<path d="M5 5h14l2 8v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4z"/>'
+    ),
+    "message": (
+        '<path d="M21 12a8 8 0 0 1-8 8H8l-5 3 1.5-4.5A8 8 0 1 1 21 12z"/>'
+    ),
+    "clock": '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    "filter": '<path d="M3 5h18l-7 8v6l-4 2v-8z"/>',
+    "download": (
+        '<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/>'
+        '<path d="M4 19h16"/>'
+    ),
+    "upload": (
+        '<path d="M12 21V9"/><path d="M7 14l5-5 5 5"/>'
+        '<path d="M4 5h16"/>'
+    ),
+    "plus_square": (
+        '<rect x="3" y="3" width="18" height="18" rx="3"/>'
+        '<path d="M12 8v8M8 12h8"/>'
+    ),
+    "arrow_right": '<path d="M4 12h16"/><path d="M14 6l6 6-6 6"/>',
+    "sliders": (
+        '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/>'
+        '<circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/>'
+        '<circle cx="17" cy="18" r="2"/>'
+    ),
+    "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+    "play": '<path d="M7 4l13 8-13 8z"/>',
+    "link": (
+        '<path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/>'
+        '<path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/>'
+    ),
+    "book_open": (
+        '<path d="M12 6.5C10.5 5 8.5 4 5 4v15c3.5 0 5.5 1 7 2.5 1.5-1.5 3.5-2.5 7-2.5V4c-3.5 0-5.5 1-7 2.5z"/>'
+        '<path d="M12 6.5v15"/>'
+    ),
+    "grid": (
+        '<rect x="3" y="3" width="7" height="7" rx="1.5"/>'
+        '<rect x="14" y="3" width="7" height="7" rx="1.5"/>'
+        '<rect x="3" y="14" width="7" height="7" rx="1.5"/>'
+        '<rect x="14" y="14" width="7" height="7" rx="1.5"/>'
+    ),
 }
 
 _SVG_TEMPLATE = (
@@ -98,7 +154,7 @@ def icon(
     name: str,
     color: str | None = None,
     size: int = 20,
-    width: float = 1.8,
+    width: float = 1.5,
 ) -> QIcon:
     """渲染一个内联 SVG 图标。
 

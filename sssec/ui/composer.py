@@ -1,4 +1,4 @@
-"""底部多行输入框、发送/停止控制与模型/范围状态。"""
+"""底部输入区：多行输入、发送/停止控制与模型、目标状态（Linear 风格）。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from sssec.ui.icons import icon
 from sssec.ui.theme import COLORS
-from sssec.ui.widgets import set_dynamic_property
+from sssec.ui.widgets import dot_pixmap, set_dynamic_property, status_dot
 
 
 class ChatInput(QPlainTextEdit):
@@ -32,7 +32,7 @@ class ChatInput(QPlainTextEdit):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setFixedHeight(46)
+        self.setFixedHeight(44)
         self.setTabChangesFocus(True)
         self.textChanged.connect(self._resize)
 
@@ -50,7 +50,7 @@ class ChatInput(QPlainTextEdit):
         document = self.document()
         document.setTextWidth(max(120, self.viewport().width()))
         height = math.ceil(document.size().height()) + 16
-        self.setFixedHeight(max(46, min(height, 156)))
+        self.setFixedHeight(max(44, min(height, 156)))
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -76,15 +76,17 @@ class Composer(QFrame):
         self._full_access = False
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(26, 12, 26, 14)
+        outer.setContentsMargins(32, 10, 32, 12)
         outer.setSpacing(0)
         self.card = QFrame()
         self.card.setObjectName("ComposerCard")
-        self.card.setMaximumWidth(920)
-        outer.addWidget(self.card, 0, Qt.AlignHCenter)
+        self.card.setMaximumWidth(784)
+        outer.addStretch(1)
+        outer.addWidget(self.card, 20)
+        outer.addStretch(1)
         card_layout = QVBoxLayout(self.card)
-        card_layout.setContentsMargins(13, 9, 10, 8)
-        card_layout.setSpacing(5)
+        card_layout.setContentsMargins(12, 9, 8, 7)
+        card_layout.setSpacing(4)
 
         self.input = ChatInput()
         self.input.submit.connect(self._submit)
@@ -92,7 +94,9 @@ class Composer(QFrame):
         card_layout.addWidget(self.input)
 
         bottom = QHBoxLayout()
-        bottom.setSpacing(7)
+        bottom.setSpacing(6)
+        self.model_status = status_dot(COLORS["faint"], 6)
+        bottom.addWidget(self.model_status, 0, Qt.AlignVCenter)
         self.model_label = QLabel("离线演示")
         self.model_label.setObjectName("Faint")
         self.model_label.setToolTip("当前模型服务")
@@ -100,8 +104,8 @@ class Composer(QFrame):
         bottom.addSpacing(2)
         self.scope_button = QPushButton("未设置目标（可选）")
         self.scope_button.setObjectName("Chip")
-        self.scope_button.setIcon(icon("target", COLORS["muted"], 13))
-        self.scope_button.setIconSize(QSize(13, 13))
+        self.scope_button.setIcon(icon("target", COLORS["muted"], 12))
+        self.scope_button.setIconSize(QSize(12, 12))
         self.scope_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.scope_button.setToolTip("设置测试目标提示与范围策略")
         self.scope_button.clicked.connect(self.scope_requested.emit)
@@ -109,8 +113,8 @@ class Composer(QFrame):
         self.access_badge = QLabel("完全权限")
         self.access_badge.setStyleSheet(
             f"color: {COLORS['red']}; background: {COLORS['red_soft']};"
-            f"border: 1px solid {COLORS['red_border']}; border-radius: 8px;"
-            "padding: 3px 7px; font-size: 8pt; font-weight: 700;"
+            f"border: 1px solid {COLORS['red_border']}; border-radius: 4px;"
+            "padding: 2px 6px; font-size: 7.5pt; font-weight: 600;"
         )
         self.access_badge.setToolTip("本对话已启用完全权限：工具免确认、范围不拦截")
         self.access_badge.setVisible(False)
@@ -120,11 +124,11 @@ class Composer(QFrame):
         self.hint = QLabel("Enter 发送 · Shift+Enter 换行")
         self.hint.setObjectName("Faint")
         bottom.addWidget(self.hint)
-        bottom.addSpacing(4)
+        bottom.addSpacing(2)
 
         self.send_button = QPushButton()
         self.send_button.setObjectName("SendButton")
-        self.send_button.setFixedSize(36, 36)
+        self.send_button.setFixedSize(30, 30)
         self.send_button.setCursor(QCursor(Qt.PointingHandCursor))
         self.send_button.setToolTip("发送（Enter）")
         self.send_button.clicked.connect(self._on_action)
@@ -182,8 +186,12 @@ class Composer(QFrame):
         self._full_access = bool(full_access)
         metrics = self.model_label.fontMetrics()
         display_model = model_label
-        self.model_label.setText(metrics.elidedText(display_model, Qt.ElideRight, 260))
+        self.model_label.setText(metrics.elidedText(display_model, Qt.ElideRight, 240))
         self.model_label.setToolTip(model_label + ("（离线演示）" if demo else ""))
+        self.model_status.setPixmap(
+            dot_pixmap(COLORS["faint"] if demo else COLORS["accent"], 6)
+        )
+        self.model_status.setToolTip("离线演示模型" if demo else "已连接模型服务")
         self.scope_button.setText(metrics.elidedText(scope_text, Qt.ElideRight, 210))
         self.scope_button.setToolTip(
             f"测试目标提示：{scope_text}\n点击设置目标与范围策略。"
@@ -191,7 +199,7 @@ class Composer(QFrame):
         set_dynamic_property(self.scope_button, "ok", "true" if scope_ok else "false")
         set_dynamic_property(self.scope_button, "warn", "false")
         self.scope_button.setIcon(
-            icon("target", COLORS["accent_text"] if scope_ok else COLORS["muted"], 13)
+            icon("target", COLORS["accent_text"] if scope_ok else COLORS["muted"], 12)
         )
         self.access_badge.setVisible(self._full_access)
         self._refresh_controls()
@@ -222,10 +230,10 @@ class Composer(QFrame):
     def _set_send_icon(self) -> None:
         color = COLORS["on_accent"]
         if self._running:
-            self.send_button.setIcon(icon("stop", color, 17, width=0))
+            self.send_button.setIcon(icon("stop", color, 14, width=0))
             self.send_button.setToolTip("停止生成")
         else:
-            self.send_button.setIcon(icon("send", color, 18))
+            self.send_button.setIcon(icon("send", color, 15))
             self.send_button.setToolTip("发送（Enter）")
 
     def _update_send_enabled(self) -> None:
@@ -239,13 +247,20 @@ class Composer(QFrame):
             self.input.setPlaceholderText(
                 "请先处理上方授权" if self._awaiting else "可以继续输入，发送需等待本轮完成"
             )
-            self.send_button.setIcon(icon("stop", COLORS["red"], 16, width=0))
+            self.send_button.setIcon(icon("stop", COLORS["red"], 14, width=0))
             self.send_button.setToolTip("停止生成")
         else:
             self.send_button.setObjectName("SendButton")
-            self._set_send_icon()
             enabled = bool(self.text()) and not self._awaiting and not self._busy_elsewhere
             self.send_button.setEnabled(enabled)
+            self.send_button.setIcon(
+                icon(
+                    "send",
+                    COLORS["on_accent"] if enabled else COLORS["faint"],
+                    15,
+                )
+            )
+            self.send_button.setToolTip("发送（Enter）")
             if self._awaiting:
                 self.hint.setText("请先处理上方工具授权")
                 self.input.setPlaceholderText("等待工具授权…")

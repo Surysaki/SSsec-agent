@@ -1,12 +1,12 @@
-"""聊天消息、工具调用卡片、审批条与欢迎空状态。"""
+"""聊天消息、工具调用卡片、审批条与欢迎空状态（Linear 风格）。"""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QCursor, QGuiApplication
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -26,11 +26,16 @@ from sssec.ui.icons import icon
 from sssec.ui.theme import COLORS
 from sssec.ui.widgets import (
     BrandMark,
+    CopyButton,
     MarkdownView,
     SuggestionCard,
     TypingDots,
-    apply_mono_font,
+    caption_label,
+    dot_pixmap,
+    meta_dot,
     set_dynamic_property,
+    status_dot,
+    tone_badge,
 )
 
 TOOL_LABELS = {
@@ -123,14 +128,61 @@ STATUS_PROPS = {
     "denied": "denied",
     "cancelled": "cancelled",
 }
-STATUS_COLORS = {
-    "awaiting": COLORS["amber"],
-    "running": COLORS["blue"],
-    "done": COLORS["green"],
-    "error": COLORS["red"],
-    "denied": COLORS["red"],
-    "cancelled": COLORS["faint"],
+_STATUS_COLOR_KEYS = {
+    "awaiting": "amber",
+    "running": "blue",
+    "done": "green",
+    "error": "red",
+    "denied": "red",
+    "cancelled": "faint",
 }
+
+# 工具卡片的彩色图标徽标：按工具语义分组，保持整体克制。
+_BLUE_TOOLS = {
+    "http_probe",
+    "dns_lookup",
+    "dns_zone_transfer",
+    "whois_lookup",
+    "port_scan",
+    "subdomain_enum",
+    "dir_scan",
+    "web_crawl",
+    "tls_certificate",
+    "api_discover",
+}
+_VIOLET_TOOLS = {
+    "codec",
+    "payload_forge",
+    "binary_info",
+    "disassemble",
+    "crypto_workshop",
+    "file_analyze",
+    "archive_extract",
+    "artifact_scan",
+    "tcp_exchange",
+}
+_CYAN_TOOLS = {"workspace_list", "workspace_read", "workspace_write"}
+_AMBER_TOOLS = {"run_command", "http_upload", "webshell_client"}
+_GREEN_TOOLS = {"save_finding", "flag_hunt"}
+
+
+def _tool_tone(name: str) -> str:
+    name = str(name or "")
+    if name in _GREEN_TOOLS:
+        return "green"
+    if name in _AMBER_TOOLS:
+        return "amber"
+    if name in _VIOLET_TOOLS:
+        return "violet"
+    if name in _BLUE_TOOLS:
+        return "blue"
+    if name in _CYAN_TOOLS:
+        return "cyan"
+    return "accent"
+
+
+def _status_color(status_prop: str) -> str:
+    return COLORS[_STATUS_COLOR_KEYS.get(status_prop, "muted")]
 
 
 def _preview_args(tool: dict[str, Any]) -> str:
@@ -207,9 +259,13 @@ class CodeView(QPlainTextEdit):
         self.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setMaximumHeight(max_height)
-        self.setMinimumHeight(min(110, max_height))
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # 按内容行数取高，避免两三行 JSON 撑出一大片空白。
+        visual_lines = sum(
+            max(1, (len(line) // 74) + 1) for line in text.splitlines() or [""]
+        )
+        height = min(max_height, max(46, visual_lines * 15 + 22))
+        self.setFixedHeight(height)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
 
 class ToolCallCard(QFrame):
@@ -217,84 +273,137 @@ class ToolCallCard(QFrame):
         super().__init__(parent)
         self.tool = tool
         self._expanded = False
+        # 参数/结果编辑器在首次展开时才创建；折叠状态不解析大 JSON，
+        # 避免长任务里每次刷新都重建几十个隐藏 QPlainTextEdit。
+        self._details: QWidget | None = None
+        self._args_view: CodeView | None = None
+        self._result_view: CodeView | None = None
+
         status = str(tool.get("status") or "pending")
         status_prop = STATUS_PROPS.get(status, "awaiting")
         self.setObjectName("ToolCard")
         set_dynamic_property(self, "status", status_prop)
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(11, 8, 11, 8)
-        self._layout.setSpacing(3)
+        self._layout.setContentsMargins(10, 8, 10, 8)
+        self._layout.setSpacing(2)
 
         header = QHBoxLayout()
         header.setSpacing(7)
-        icon_color = STATUS_COLORS.get(status_prop, COLORS["muted"])
-        icon_label = QLabel()
-        icon_label.setPixmap(
-            icon(TOOL_ICONS.get(str(tool.get("name")), "terminal"), icon_color, 15).pixmap(
-                15, 15
-            )
-        )
-        header.addWidget(icon_label, 0, Qt.AlignVCenter)
+        self._status_dot = status_dot(_status_color(status_prop), 6)
+        header.addWidget(self._status_dot, 0, Qt.AlignVCenter)
 
-        name_label = QLabel(TOOL_LABELS.get(str(tool.get("name")), str(tool.get("name"))))
+        tool_name = str(tool.get("name"))
+        header.addWidget(
+            tone_badge(
+                TOOL_ICONS.get(tool_name, "terminal"),
+                _tool_tone(tool_name),
+                size=22,
+                icon_size=12,
+            ),
+            0,
+            Qt.AlignVCenter,
+        )
+
+        name_label = QLabel(TOOL_LABELS.get(tool_name, tool_name))
         name_label.setObjectName("ToolName")
         header.addWidget(name_label)
-        mono = QLabel(str(tool.get("name") or ""))
+        mono = QLabel(tool_name)
         mono.setObjectName("ToolMono")
         header.addWidget(mono)
         header.addStretch(1)
 
-        status_label = QLabel(STATUS_LABELS.get(status, status))
-        status_label.setObjectName("ToolStatus")
-        set_dynamic_property(status_label, "status", status_prop)
-        header.addWidget(status_label)
+        self._duration_label = QLabel("")
+        self._duration_label.setObjectName("ToolMeta")
+        header.addWidget(self._duration_label)
+
+        self._status_label = QLabel(STATUS_LABELS.get(status, status))
+        self._status_label.setObjectName("ToolStatus")
+        set_dynamic_property(self._status_label, "status", status_prop)
+        header.addWidget(self._status_label)
 
         self._expand_button = QToolButton()
-        self._expand_button.setIcon(icon("chevron_right", COLORS["faint"], 14))
+        self._expand_button.setObjectName("Ghost")
+        self._expand_button.setIcon(icon("chevron_right", COLORS["faint"], 12))
         self._expand_button.setIconSize(self._expand_button.iconSize())
         self._expand_button.setCursor(QCursor(Qt.PointingHandCursor))
         self._expand_button.setToolTip("查看参数与结果")
+        self._expand_button.setFixedSize(22, 22)
         self._expand_button.clicked.connect(self._toggle)
         header.addWidget(self._expand_button)
         self._layout.addLayout(header)
 
-        summary = QLabel(_preview_args(tool))
-        summary.setObjectName("ToolSummary")
-        summary.setWordWrap(True)
-        summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self._layout.addWidget(summary)
+        self._summary = QLabel("")
+        self._summary.setObjectName("ToolSummary")
+        self._summary.setWordWrap(True)
+        self._summary.setContentsMargins(33, 0, 0, 0)
+        self._summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._layout.addWidget(self._summary)
 
+        self.update_tool(tool)
+
+    def update_tool(self, tool: dict[str, Any]) -> None:
+        """就地更新状态/摘要，不重建整张卡片。"""
+        self.tool = tool
+        status = str(tool.get("status") or "pending")
+        status_prop = STATUS_PROPS.get(status, "awaiting")
+        set_dynamic_property(self, "status", status_prop)
+        self._status_dot.setPixmap(dot_pixmap(_status_color(status_prop), 6))
+        self._status_label.setText(STATUS_LABELS.get(status, status))
+        set_dynamic_property(self._status_label, "status", status_prop)
+        self._summary.setText(_preview_args(tool))
         duration = tool.get("duration_ms")
-        if status in ("done", "error", "denied") and duration is not None:
-            info = QLabel(f"耗时 {duration} ms")
-            info.setObjectName("ToolMeta")
-            self._layout.addWidget(info)
+        if duration is not None:
+            self._duration_label.setText(f"{duration} ms")
+            self._duration_label.setVisible(True)
+        else:
+            self._duration_label.setVisible(False)
+        if self._details is not None and self._expanded:
+            self._build_details()
 
-        self._details = QWidget()
-        details_layout = QVBoxLayout(self._details)
-        details_layout.setContentsMargins(0, 6, 0, 1)
+    def _clear_details(self) -> None:
+        if self._details is None:
+            return
+        while self._details.layout() and self._details.layout().count():
+            item = self._details.layout().takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                dispose_widget(widget)
+        self._details.hide()
+        self._details.setParent(None)
+        self._details.deleteLater()
+        self._details = None
+        self._args_view = None
+        self._result_view = None
+
+    def _build_details(self) -> None:
+        self._clear_details()
+        details = QWidget()
+        details_layout = QVBoxLayout(details)
+        details_layout.setContentsMargins(33, 6, 0, 1)
         details_layout.setSpacing(5)
-        caption_args = QLabel("参数")
-        caption_args.setObjectName("SectionCaption")
-        details_layout.addWidget(caption_args)
-        details_layout.addWidget(CodeView(_pretty_json(tool.get("args") or {}), 150))
-        result = tool.get("result") or tool.get("error") or ""
+        details_layout.addWidget(caption_label("参数"))
+        self._args_view = CodeView(_pretty_json(self.tool.get("args") or {}), 150)
+        details_layout.addWidget(self._args_view)
+        result = self.tool.get("result") or self.tool.get("error") or ""
         if result:
-            caption_result = QLabel("结果")
-            caption_result.setObjectName("SectionCaption")
-            details_layout.addWidget(caption_result)
-            details_layout.addWidget(CodeView(_pretty_json(result), 230))
-        self._details.setVisible(False)
-        self._layout.addWidget(self._details)
+            details_layout.addWidget(caption_label("结果"))
+            self._result_view = CodeView(_pretty_json(result), 230)
+            details_layout.addWidget(self._result_view)
+        self._details = details
+        self._layout.addWidget(details)
+        details.setVisible(self._expanded)
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
-        self._details.setVisible(self._expanded)
+        if self._expanded and self._details is None:
+            self._build_details()
+        if self._details is not None:
+            self._details.setVisible(self._expanded)
         self._expand_button.setIcon(
             icon(
                 "chevron_down" if self._expanded else "chevron_right",
                 COLORS["muted"],
-                14,
+                12,
             )
         )
 
@@ -304,11 +413,11 @@ class ReasoningBlock(QFrame):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(3)
+        layout.setSpacing(4)
         self._button = QToolButton()
         self._button.setObjectName("ReasoningToggle")
         self._button.setText("思考过程")
-        self._button.setIcon(icon("chevron_right", COLORS["muted"], 14))
+        self._button.setIcon(icon("chevron_right", COLORS["muted"], 12))
         self._button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self._button.setCursor(QCursor(Qt.PointingHandCursor))
         self._button.clicked.connect(self._toggle)
@@ -321,6 +430,10 @@ class ReasoningBlock(QFrame):
         layout.addWidget(self._label)
         self._expanded = False
 
+    def set_text(self, text: str) -> None:
+        if self._label.text() != text:
+            self._label.setText(text)
+
     def _toggle(self) -> None:
         self._expanded = not self._expanded
         self._label.setVisible(self._expanded)
@@ -328,7 +441,7 @@ class ReasoningBlock(QFrame):
             icon(
                 "chevron_down" if self._expanded else "chevron_right",
                 COLORS["muted"],
-                14,
+                12,
             )
         )
 
@@ -339,13 +452,17 @@ class UserMessageWidget(QWidget):
         self.message = message
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(9)
+        outer.setSpacing(6)
         outer.addStretch(1)
+        # 发送者的复制按钮紧贴气泡左侧，复制的是发送者写的那段话。
+        self.copy_button = CopyButton(tooltip="复制发送内容")
+        self.copy_button.set_provider(lambda: str(self.message.get("content") or ""))
+        outer.addWidget(self.copy_button, 0, Qt.AlignVCenter)
         bubble = QFrame()
         bubble.setObjectName("UserBubble")
-        bubble.setMaximumWidth(670)
+        bubble.setMaximumWidth(600)
         layout = QVBoxLayout(bubble)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(0)
         label = QLabel(str(message.get("content") or ""))
         label.setObjectName("UserText")
@@ -356,7 +473,7 @@ class UserMessageWidget(QWidget):
         outer.addWidget(bubble)
         avatar = QLabel("你")
         avatar.setObjectName("UserAvatar")
-        avatar.setFixedSize(28, 28)
+        avatar.setFixedSize(22, 22)
         avatar.setAlignment(Qt.AlignCenter)
         outer.addWidget(avatar, 0, Qt.AlignTop)
 
@@ -368,6 +485,14 @@ class AssistantMessageWidget(QWidget):
         self._last_text_view: MarkdownView | None = None
         self._last_text_index: int = -1
         self._typing: TypingDots | None = None
+        self._typing_host: QWidget | None = None
+        self._typing_label: QLabel | None = None
+        self._segment_widgets: list[QWidget | None] = []
+        self._text_views: dict[int, MarkdownView] = {}
+        self._tool_cards: dict[int, ToolCallCard] = {}
+        self._reasoning_blocks: dict[int, ReasoningBlock] = {}
+        self._error_card: QFrame | None = None
+        self._footer_key: tuple | None = None
         self._body_host = QWidget()
         self._body_layout = QVBoxLayout(self._body_host)
         self._body_layout.setContentsMargins(0, 0, 0, 0)
@@ -375,61 +500,70 @@ class AssistantMessageWidget(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(7)
+        root.setSpacing(6)
 
         header = QHBoxLayout()
-        header.setSpacing(8)
-        header.addWidget(BrandMark(22), 0, Qt.AlignVCenter)
+        header.setSpacing(7)
+        header.addWidget(BrandMark(17), 0, Qt.AlignVCenter)
         name = QLabel("SSsec")
         name.setObjectName("AssistantName")
         header.addWidget(name)
-        meta_text = str(message.get("model") or "SSsec Agent")
-        meta = QLabel(meta_text)
+        meta = QLabel(str(message.get("model") or "SSsec Agent"))
         meta.setObjectName("AssistantMeta")
         header.addWidget(meta)
-        header.addStretch(1)
+        header.addWidget(meta_dot())
         time_label = QLabel(format_local_time(str(message.get("created_at") or ""), "%H:%M"))
         time_label.setObjectName("AssistantMeta")
         header.addWidget(time_label)
-        self.copy_button = QToolButton()
-        self.copy_button.setIcon(icon("copy", COLORS["faint"], 14))
-        self.copy_button.setToolTip("复制回答")
-        self.copy_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.copy_button.clicked.connect(self._copy)
-        header.addWidget(self.copy_button)
+        self.copy_button = CopyButton(tooltip="复制回答")
+        self.copy_button.set_provider(lambda: assistant_text(self.message))
+        header.addWidget(self.copy_button, 0, Qt.AlignVCenter)
+        header.addStretch(1)
         root.addLayout(header)
 
         indented = QHBoxLayout()
-        indented.setContentsMargins(30, 0, 0, 0)
+        indented.setContentsMargins(24, 0, 0, 0)
         indented.addWidget(self._body_host, 1)
         root.addLayout(indented)
 
         self.footer_host = QWidget()
         self.footer_layout = QHBoxLayout(self.footer_host)
-        self.footer_layout.setContentsMargins(30, 0, 0, 0)
+        self.footer_layout.setContentsMargins(24, 0, 0, 0)
         self.footer_layout.setSpacing(7)
         root.addWidget(self.footer_host)
 
         self.sync_from_data(message)
 
-    def _copy(self) -> None:
-        QGuiApplication.clipboard().setText(assistant_text(self.message))
-
     def append_delta(self, kind: str, text: str) -> None:
+        if kind != "text" or not text:
+            return
         segments = self.message.get("segments") or []
+        if not segments:
+            return
         latest_index = len(segments) - 1
-        if (
-            kind == "text"
-            and self._last_text_view is not None
-            and latest_index == self._last_text_index
-        ):
-            current = self._last_text_view.source()
-            self._last_text_view.set_markdown(current + text, debounce=True)
-        else:
-            # 工具执行后的新一轮文本会形成新的 text segment，必须重绘，
-            # 不能把内容追加到工具调用之前的 Markdown 视图。
+        segment = segments[latest_index]
+        if segment.get("type") != "text":
+            return
+        if latest_index >= len(self._segment_widgets):
             self.sync_from_data(self.message)
-        self._ensure_typing(False)
+            return
+        view = self._text_views.get(latest_index)
+        if view is None:
+            self.sync_from_data(self.message)
+            view = self._text_views.get(latest_index)
+        if view is None:
+            return
+        target = str(segment.get("text") or "")
+        if not view.is_streaming():
+            if target != view.source():
+                view.set_stream_text(target)
+        elif target.startswith(view.source()):
+            delta = target[len(view.source()):]
+            if delta:
+                view.append_stream_text(delta)
+        elif target != view.source():
+            view.set_stream_text(target)
+        self._refresh_typing()
 
     def _clear_body(self) -> None:
         while self._body_layout.count():
@@ -442,90 +576,184 @@ class AssistantMessageWidget(QWidget):
             widget = item.widget()
             if widget is not None:
                 dispose_widget(widget)
+        self._segment_widgets = []
+        self._text_views = {}
+        self._tool_cards = {}
+        self._reasoning_blocks = {}
+        self._typing_host = None
+        self._typing_label = None
+        self._typing = None
+        self._error_card = None
+        self._footer_key = None
         self._last_text_view = None
         self._last_text_index = -1
-        self._typing = None
 
-    def sync_from_data(self, message: dict[str, Any]) -> None:
-        self.message = message
-        self._clear_body()
-        segments = message.get("segments") or []
-        has_text = False
-        for index, segment in enumerate(segments):
+    def _insert_segment_widget(self, index: int, widget: QWidget) -> None:
+        position = sum(
+            1 for item in self._segment_widgets[:index] if item is not None
+        )
+        self._body_layout.insertWidget(position, widget)
+
+    def _build_segment(self, index: int, segment: dict[str, Any], status: str) -> None:
+        seg_type = segment.get("type")
+        if seg_type == "text":
+            text = str(segment.get("text") or "")
+            if not text:
+                self._segment_widgets.append(None)
+                return
+            view = MarkdownView()
+            is_last = index == len(self.message.get("segments") or []) - 1
+            if status == "streaming" and is_last:
+                view.set_stream_text(text)
+            else:
+                view.set_markdown(text)
+            self._body_layout.addWidget(view)
+            self._segment_widgets.append(view)
+            self._text_views[index] = view
+            self._last_text_view = view
+            self._last_text_index = index
+        elif seg_type == "reasoning":
+            text = str(segment.get("text") or "").strip()
+            block = ReasoningBlock(text)
+            self._body_layout.addWidget(block)
+            self._segment_widgets.append(block)
+            self._reasoning_blocks[index] = block
+        elif seg_type == "tool":
+            tool = segment.get("tool") or {}
+            card = ToolCallCard(tool)
+            self._body_layout.addWidget(card)
+            self._segment_widgets.append(card)
+            self._tool_cards[index] = card
+        else:
+            self._segment_widgets.append(None)
+
+    def _needs_rebuild(self, segments: list[dict[str, Any]]) -> bool:
+        if len(segments) < len(self._segment_widgets):
+            return True
+        for index, segment in enumerate(segments[: len(self._segment_widgets)]):
+            widget = self._segment_widgets[index]
             seg_type = segment.get("type")
             if seg_type == "text":
-                text = str(segment.get("text") or "")
-                if not text:
+                if widget is None:
                     continue
-                view = MarkdownView(text)
-                self._body_layout.addWidget(view)
-                self._last_text_view = view
-                self._last_text_index = index
-                has_text = True
+                if not isinstance(widget, MarkdownView):
+                    return True
             elif seg_type == "reasoning":
-                text = str(segment.get("text") or "").strip()
-                if text:
-                    self._body_layout.addWidget(ReasoningBlock(text))
+                if not isinstance(widget, ReasoningBlock):
+                    return True
             elif seg_type == "tool":
-                tool = segment.get("tool") or {}
-                self._body_layout.addWidget(ToolCallCard(tool))
+                if not isinstance(widget, ToolCallCard):
+                    return True
+        return False
 
-        status = str(message.get("status") or "complete")
-        if not segments and status == "streaming":
-            typing_host = QWidget()
-            typing_layout = QHBoxLayout(typing_host)
-            typing_layout.setContentsMargins(0, 0, 0, 0)
-            typing_layout.setSpacing(7)
-            self._typing = TypingDots()
-            self._typing.start()
-            typing_layout.addWidget(self._typing)
-            hint = QLabel("正在思考…")
-            hint.setObjectName("StreamingHint")
-            typing_layout.addWidget(hint)
-            typing_layout.addStretch(1)
-            self._body_layout.addWidget(typing_host)
-        elif status == "streaming" and not has_text:
-            typing_host = QWidget()
-            typing_layout = QHBoxLayout(typing_host)
-            typing_layout.setContentsMargins(0, 0, 0, 0)
-            typing_layout.setSpacing(7)
-            self._typing = TypingDots()
-            self._typing.start()
-            typing_layout.addWidget(self._typing)
-            hint = QLabel("正在使用工具…")
-            hint.setObjectName("StreamingHint")
-            typing_layout.addWidget(hint)
-            typing_layout.addStretch(1)
-            self._body_layout.addWidget(typing_host)
+    def _rebuild_body(self) -> None:
+        self._clear_body()
+        segments = self.message.get("segments") or []
+        status = str(self.message.get("status") or "complete")
+        for index, segment in enumerate(segments):
+            self._build_segment(index, segment, status)
+        self._refresh_typing()
+        self._refresh_error()
+        self._refresh_footer()
 
-        if status == "error" and message.get("error"):
-            error_card = QFrame()
-            error_card.setObjectName("ErrorCard")
-            error_layout = QHBoxLayout(error_card)
-            error_layout.setContentsMargins(10, 8, 10, 8)
-            error_layout.setSpacing(7)
+    def _refresh_typing(self) -> None:
+        segments = self.message.get("segments") or []
+        status = str(self.message.get("status") or "complete")
+        has_text = any(
+            segment.get("type") == "text" and str(segment.get("text") or "").strip()
+            for segment in segments
+        )
+        if status == "streaming" and not has_text:
+            hint = "正在思考…" if not segments else "正在使用工具…"
+            if self._typing_host is None:
+                host = QWidget()
+                layout = QHBoxLayout(host)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(6)
+                self._typing = TypingDots()
+                self._typing.start()
+                layout.addWidget(self._typing, 0, Qt.AlignVCenter)
+                self._typing_label = QLabel(hint)
+                self._typing_label.setObjectName("StreamingHint")
+                layout.addWidget(self._typing_label, 0, Qt.AlignVCenter)
+                layout.addStretch(1)
+                self._body_layout.addWidget(host)
+                self._typing_host = host
+            elif self._typing_label is not None and self._typing_label.text() != hint:
+                self._typing_label.setText(hint)
+            if self._typing is not None:
+                self._typing.start()
+        elif self._typing_host is not None:
+            self._typing_host.hide()
+            self._typing_host.setParent(None)
+            self._typing_host.deleteLater()
+            self._typing_host = None
+            self._typing_label = None
+            self._typing = None
+
+    def _refresh_error(self) -> None:
+        status = str(self.message.get("status") or "complete")
+        error = str(self.message.get("error") or "") if status == "error" else ""
+        if not error:
+            if self._error_card is not None:
+                self._error_card.hide()
+                self._error_card.setParent(None)
+                self._error_card.deleteLater()
+                self._error_card = None
+            return
+        if self._error_card is None:
+            card = QFrame()
+            card.setObjectName("ErrorCard")
+            layout = QHBoxLayout(card)
+            layout.setContentsMargins(10, 8, 10, 8)
+            layout.setSpacing(7)
             err_icon = QLabel()
-            err_icon.setPixmap(icon("alert", COLORS["red"], 15).pixmap(15, 15))
-            error_layout.addWidget(err_icon, 0, Qt.AlignTop)
-            error_text = QLabel(str(message.get("error")))
-            error_text.setObjectName("ErrorText")
-            error_text.setWordWrap(True)
-            error_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            error_layout.addWidget(error_text, 1)
-            self._body_layout.addWidget(error_card)
+            err_icon.setPixmap(icon("alert", COLORS["red"], 14).pixmap(14, 14))
+            layout.addWidget(err_icon, 0, Qt.AlignTop)
+            text = QLabel(error)
+            text.setObjectName("ErrorText")
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(text, 1)
+            self._body_layout.addWidget(card)
+            self._error_card = card
+        else:
+            labels = self._error_card.findChildren(QLabel, "ErrorText")
+            if labels and labels[0].text() != error:
+                labels[0].setText(error)
 
+    def _refresh_footer(self) -> None:
+        segments = self.message.get("segments") or []
+        status = str(self.message.get("status") or "complete")
+        has_text = any(
+            segment.get("type") == "text" and str(segment.get("text") or "").strip()
+            for segment in segments
+        )
+        key = (status, has_text, len(segments))
+        if key == self._footer_key:
+            self.footer_host.setVisible(self.footer_layout.count() > 0)
+            return
+        self._footer_key = key
+        while self.footer_layout.count():
+            item = self.footer_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                dispose_widget(widget)
         if status == "streaming":
+            self.footer_layout.addWidget(status_dot(COLORS["accent"], 5))
             hint = QLabel("正在生成")
             hint.setObjectName("StreamingHint")
             self.footer_layout.addWidget(hint)
             self.footer_layout.addStretch(1)
         elif status == "awaiting_approval":
+            self.footer_layout.addWidget(status_dot(COLORS["amber"], 5))
             hint = QLabel("等待你确认工具调用")
             hint.setObjectName("StreamingHint")
-            hint.setStyleSheet(f"color: {COLORS['amber']}; font-size: 8.5pt;")
+            hint.setStyleSheet(f"color: {COLORS['amber']}; font-size: 8.3pt;")
             self.footer_layout.addWidget(hint)
             self.footer_layout.addStretch(1)
         elif status == "cancelled":
+            self.footer_layout.addWidget(status_dot(COLORS["faint"], 5))
             hint = QLabel("已停止生成")
             hint.setObjectName("StreamingHint")
             self.footer_layout.addWidget(hint)
@@ -537,11 +765,82 @@ class AssistantMessageWidget(QWidget):
             self.footer_layout.addStretch(1)
         self.footer_host.setVisible(self.footer_layout.count() > 0)
 
-    def _ensure_typing(self, visible: bool) -> None:
-        if self._typing is not None and visible:
-            self._typing.start()
-        elif self._typing is not None and not visible:
-            self._typing.stop()
+    def sync_from_data(self, message: dict[str, Any]) -> None:
+        self.message = message
+        segments = message.get("segments") or []
+        status = str(message.get("status") or "complete")
+        if self._needs_rebuild(segments):
+            self._rebuild_body()
+            return
+
+        # 新增 segment 时先移除 typing 行，保证它始终在末尾。
+        if self._typing_host is not None:
+            self._typing_host.hide()
+            self._typing_host.setParent(None)
+            self._typing_host.deleteLater()
+            self._typing_host = None
+            self._typing_label = None
+            self._typing = None
+        for index in range(len(self._segment_widgets), len(segments)):
+            self._build_segment(index, segments[index], status)
+
+        last_index = len(segments) - 1
+        for index, segment in enumerate(segments):
+            widget = (
+                self._segment_widgets[index]
+                if index < len(self._segment_widgets)
+                else None
+            )
+            seg_type = segment.get("type")
+            if seg_type == "text":
+                text = str(segment.get("text") or "")
+                if not text:
+                    continue
+                if widget is None:
+                    widget = MarkdownView()
+                    self._insert_segment_widget(index, widget)
+                    self._segment_widgets[index] = widget
+                    self._text_views[index] = widget
+                view = widget
+                if not isinstance(view, MarkdownView):
+                    continue
+                if view.source() != text:
+                    if status == "streaming" and index == last_index:
+                        view.set_stream_text(text)
+                    else:
+                        if view.is_streaming():
+                            view.finish_stream()
+                        view.set_markdown(text)
+                if status == "streaming" and index == last_index and not view.is_streaming():
+                    view.set_stream_text(text)
+            elif seg_type == "reasoning":
+                text = str(segment.get("text") or "").strip()
+                if widget is None:
+                    block = ReasoningBlock(text)
+                    self._insert_segment_widget(index, block)
+                    self._segment_widgets[index] = block
+                    self._reasoning_blocks[index] = block
+                elif isinstance(widget, ReasoningBlock):
+                    widget.set_text(text)
+            elif seg_type == "tool":
+                tool = segment.get("tool") or {}
+                if widget is None:
+                    card = ToolCallCard(tool)
+                    self._insert_segment_widget(index, card)
+                    self._segment_widgets[index] = card
+                    self._tool_cards[index] = card
+                elif isinstance(widget, ToolCallCard):
+                    widget.update_tool(tool)
+
+        # 跨过工具/推理的文本段已经结束，立即渲染它的 Markdown；
+        # 最后一个文本段如果仍在流式输出，继续保留纯文本增量模式。
+        for index, view in list(self._text_views.items()):
+            if status != "streaming" or index != last_index:
+                view.finish_stream()
+
+        self._refresh_typing()
+        self._refresh_error()
+        self._refresh_footer()
 
 
 class ApprovalBar(QFrame):
@@ -553,14 +852,14 @@ class ApprovalBar(QFrame):
         self.setObjectName("ApprovalBar")
         self._calls: list[dict] = []
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 11, 14, 11)
-        layout.setSpacing(7)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
 
         top = QHBoxLayout()
-        top.setSpacing(8)
+        top.setSpacing(7)
         alert_icon = QLabel()
-        alert_icon.setPixmap(icon("alert", COLORS["amber"], 17).pixmap(17, 17))
-        top.addWidget(alert_icon, 0, Qt.AlignTop)
+        alert_icon.setPixmap(icon("alert", COLORS["amber"], 15).pixmap(15, 15))
+        top.addWidget(alert_icon, 0, Qt.AlignVCenter)
         self.title = QLabel("需要你的确认")
         self.title.setObjectName("ApprovalTitle")
         top.addWidget(self.title)
@@ -579,20 +878,21 @@ class ApprovalBar(QFrame):
         self.command_preview = QPlainTextEdit()
         self.command_preview.setObjectName("CodeBlock")
         self.command_preview.setReadOnly(True)
-        self.command_preview.setMaximumHeight(96)
-        self.command_preview.setMinimumHeight(58)
+        self.command_preview.setMaximumHeight(88)
+        self.command_preview.setMinimumHeight(54)
         self.command_preview.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.command_preview.setVisible(False)
         layout.addWidget(self.command_preview)
 
         self.warning = QLabel("")
         self.warning.setObjectName("ApprovalBody")
-        self.warning.setStyleSheet(f"color: {COLORS['amber']}; font-size: 8.5pt;")
+        self.warning.setStyleSheet(f"color: {COLORS['amber']}; font-size: 8.2pt;")
         self.warning.setWordWrap(True)
         self.warning.setVisible(False)
         layout.addWidget(self.warning)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(6)
         buttons.addStretch(1)
         self.deny_button = QPushButton("拒绝")
         self.deny_button.setObjectName("Secondary")
@@ -610,7 +910,7 @@ class ApprovalBar(QFrame):
         self._calls = calls
         worker_label = str(payload.get("worker_label") or "").strip()
         self.title.setText(
-            f"需要你的确认 · {worker_label}" if worker_label else "需要你的确认"
+            f"需要确认 · {worker_label}" if worker_label else "需要你的确认"
         )
         self.count_label.setText(f"{len(calls)} 项工具调用")
         lines: list[str] = []
@@ -619,9 +919,9 @@ class ApprovalBar(QFrame):
             preview = _preview_args(call)
             if len(preview) > 155:
                 preview = preview[:155] + "…"
-            lines.append(f"•  {label}：{preview}")
+            lines.append(f"·  {label}：{preview}")
         if len(calls) > 4:
-            lines.append(f"•  以及另外 {len(calls) - 4} 项调用")
+            lines.append(f"·  以及另外 {len(calls) - 4} 项调用")
         self.detail.setText("\n".join(lines) or "工具调用等待确认。")
         has_command = any(call.get("name") == "run_command" for call in calls)
         commands = [
@@ -631,9 +931,10 @@ class ApprovalBar(QFrame):
         ]
         self.command_preview.setVisible(has_command)
         if has_command:
-            self.command_preview.setPlainText(
-                "\n\n".join(f"$ {command}" for command in commands)
-            )
+            command_text = "\n\n".join(f"$ {command}" for command in commands)
+            self.command_preview.setPlainText(command_text)
+            lines = max(1, command_text.count("\n") + 1)
+            self.command_preview.setFixedHeight(min(96, max(42, lines * 15 + 18)))
         else:
             self.command_preview.clear()
         has_write_http = any(
@@ -681,18 +982,18 @@ class EmptyState(QWidget):
         super().__init__()
         self._conversation = conversation
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 40, 0, 20)
+        layout.setContentsMargins(0, 34, 0, 16)
         layout.setSpacing(0)
         layout.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
 
-        mark = BrandMark(64)
+        mark = BrandMark(52)
         layout.addWidget(mark, 0, Qt.AlignHCenter)
-        layout.addSpacing(20)
+        layout.addSpacing(16)
         heading = QLabel("开始一次安全测试")
         heading.setObjectName("EmptyHeading")
         heading.setAlignment(Qt.AlignCenter)
         layout.addWidget(heading)
-        layout.addSpacing(8)
+        layout.addSpacing(6)
         sub = QLabel(
             "设置目标提示，或直接为当前对话开启完全权限，让 SSsec 完成信息收集、验证与记录。"
         )
@@ -700,26 +1001,25 @@ class EmptyState(QWidget):
         sub.setAlignment(Qt.AlignCenter)
         sub.setWordWrap(True)
         layout.addWidget(sub)
-        layout.addSpacing(22)
+        layout.addSpacing(20)
 
         scope_card = QFrame()
         scope_card.setObjectName("Card")
         scope_layout = QHBoxLayout(scope_card)
-        scope_layout.setContentsMargins(14, 11, 14, 11)
+        scope_layout.setContentsMargins(12, 10, 12, 10)
         scope_layout.setSpacing(10)
         authorized = bool(conversation and conversation.scope)
         full_access = bool(conversation and conversation.full_permission)
-        icon_label = QLabel()
-        icon_label.setPixmap(
-            icon(
-                "shield" if authorized else "target",
-                COLORS["green"] if authorized else COLORS["accent"],
-                20,
-            ).pixmap(20, 20)
+
+        badge = tone_badge(
+            "bolt" if full_access else ("shield" if authorized else "target"),
+            "red" if full_access else ("green" if authorized else "accent"),
+            size=28,
+            icon_size=16,
         )
-        scope_layout.addWidget(icon_label, 0, Qt.AlignVCenter)
+        scope_layout.addWidget(badge, 0, Qt.AlignVCenter)
         text_layout = QVBoxLayout()
-        text_layout.setSpacing(2)
+        text_layout.setSpacing(1)
         if full_access:
             scope_title_text = "完全权限已开启"
             scope_detail = "所有工具调用免人工确认，且不按目标范围拦截。"
@@ -740,35 +1040,35 @@ class EmptyState(QWidget):
         text_layout.addWidget(scope_title)
         text_layout.addWidget(scope_text)
         scope_layout.addLayout(text_layout, 1)
-        scope_button = QPushButton("编辑范围与权限" if (authorized or full_access) else "设置范围 / 完全权限")
+        scope_button = QPushButton("编辑" if (authorized or full_access) else "设置")
         scope_button.setObjectName("Secondary")
         scope_button.clicked.connect(self.scope_requested.emit)
         scope_layout.addWidget(scope_button)
         layout.addWidget(scope_card)
         layout.addSpacing(18)
 
-        caption = QLabel("可以这样开始")
-        caption.setObjectName("SectionCaption")
+        caption = caption_label("可以这样开始")
         layout.addWidget(caption)
-        layout.addSpacing(7)
+        layout.addSpacing(6)
         suggestions = [
-            ("梳理测试计划", "根据测试目标制定低影响、可回滚的测试步骤"),
-            ("只读信息收集", "查询 DNS、HTTP 与常见端口连通性"),
-            ("检查 HTTP 安全响应头", "识别缺失的安全头并给出修复建议"),
+            ("梳理测试计划", "根据测试目标制定低影响、可回滚的测试步骤", "layers", "accent"),
+            ("只读信息收集", "查询 DNS、HTTP 与常见端口连通性", "globe", "cyan"),
+            ("检查 HTTP 安全响应头", "识别缺失的安全头并给出修复建议", "shield", "green"),
         ]
-        for title, subtitle in suggestions:
-            card = SuggestionCard(title, subtitle)
+        for title, subtitle, icon_name, tone in suggestions:
+            card = SuggestionCard(title, subtitle, icon_name=icon_name, tone=tone)
             card.clicked.connect(
                 lambda _checked=False, text=f"{title}：{subtitle}": self.prompt_selected.emit(
                     text
                 )
             )
             layout.addWidget(card)
-            layout.addSpacing(7)
+            layout.addSpacing(6)
 
         layout.addSpacing(12)
         if demo_mode:
             demo_row = QHBoxLayout()
+            demo_row.setSpacing(6)
             demo_row.addStretch(1)
             demo_note = QLabel("当前使用离线演示模型，不会执行真实工具")
             demo_note.setObjectName("HelpText")
@@ -788,5 +1088,14 @@ class EmptyState(QWidget):
         disclaimer.setWordWrap(True)
         layout.addWidget(disclaimer)
         layout.addStretch(1)
-        self.setMinimumWidth(560)
-        self.setMaximumWidth(700)
+        self.setMinimumWidth(600)
+        self.setMaximumWidth(680)
+
+
+__all__ = [
+    "ApprovalBar",
+    "AssistantMessageWidget",
+    "EmptyState",
+    "ToolCallCard",
+    "UserMessageWidget",
+]

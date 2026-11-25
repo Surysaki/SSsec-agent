@@ -17,12 +17,18 @@ from sssec.agent.runtime import AgentContext
 from sssec.agent.state import (
     HANDOFF_TARGETS,
     MAX_TEAM_STEPS,
+    MAX_TEAM_STEPS_HARD,
     WORKER_LABELS,
     WORKER_ORDER,
     PentestState,
 )
+from sssec.agent.toolkit import extract_flags
 
 logger = logging.getLogger("sssec.agent")
+
+# 连续“没有新证据”时允许升级几次（换阶段 / 升级 final），超过后才允许 blocked 收尾。
+MAX_ESCALATIONS = 2
+_FLAG_MISSION_RE = re.compile(r"flag|ctf|夺旗|靶场", re.IGNORECASE)
 
 _TARGET_ALIASES = {
     "recon": "recon",
@@ -42,6 +48,10 @@ _TARGET_ALIASES = {
     "逆向分析": "reverse",
     "二进制": "reverse",
     "固件": "reverse",
+    "final": "final",
+    "最终突破": "final",
+    "最终汇总": "final",
+    "汇总突破": "final",
     "finish": "finish",
     "done": "finish",
     "收尾": "finish",
@@ -62,6 +72,24 @@ def last_user_text(state: PentestState) -> str:
             if text:
                 return text
     return "未提供明确目标"
+
+
+def mission_objective(state: PentestState) -> str:
+    """任务目标：优先用运行开始时记录的 mission，避免“继续”覆盖掉原始目标。"""
+    stored = str(state.get("mission_objective") or "").strip()
+    return stored or last_user_text(state)
+
+
+def is_flag_mission(state: PentestState) -> bool:
+    return bool(_FLAG_MISSION_RE.search(mission_objective(state)))
+
+
+def has_flag(state: PentestState) -> bool:
+    for message in state.get("messages") or []:
+        content = extract_text(getattr(message, "content", ""))
+        if content and extract_flags(content):
+            return True
+    return False
 
 
 def _clip(value: Any, limit: int) -> str:
@@ -155,16 +183,17 @@ async def decide(
     step = int(state.get("step") or 0) + 1
     # 后期重试时除了工具轮次，也给指挥官更多调度轮次。
     bonus = max(0, int(getattr(ctx, "round_bonus", 0) or 0))
-    max_steps = MAX_TEAM_STEPS + min(16, bonus * 2)
-    if step > max_steps:
+    soft_steps = MAX_TEAM_STEPS + min(16, bonus * 2)
+    hard_steps = MAX_TEAM_STEPS_HARD + bonus * 4
+    if step > hard_steps:
         return (
             {
                 "next": "finish",
                 "task": "",
-                "reason": f"已达到最大调度轮次 {max_steps}",
-                "summary": "达到最大调度轮次，按当前证据收尾。",
+                "reason": f"已达到调度硬熔断 {hard_steps} 步",
+                "summary": "调度步数达到安全熔断上限，按当前证据收尾。",
             },
-            "limit",
+            "hard-limit",
         )
 
     if isinstance(model, DemoChatModel):
@@ -172,12 +201,22 @@ async def decide(
 
     prompt = build_commander_prompt(
         ctx.system_prompt,
-        objective=last_user_text(state),
+        objective=mission_objective(state),
         reports=state.get("worker_reports") or [],
         step=step,
-        max_steps=max_steps,
+        max_steps=soft_steps,
         handoff=state.get("handoff"),
+        skills_index=(
+            ctx.skill_store().index_text()
+            if getattr(ctx.settings.safety, "skills_enabled", True)
+            else ""
+        ),
     )
+    if step > soft_steps:
+        prompt += (
+            f"\n\n## 策略复盘\n调度序号 {step} 已超过软预算 {soft_steps}。"
+            "不要因此收尾：检查是否在重复同一条路线，换阶段、换思路或升级到 `final`。"
+        )
     try:
         reply = await model.ainvoke(
             [
@@ -236,27 +275,80 @@ async def commander_node(
     model: BaseChatModel,
     state: PentestState,
 ) -> dict[str, Any]:
-    """指挥官节点：输出下一阶段、任务简报与调度日志。"""
+    """指挥官节点：输出下一阶段、任务简报与调度日志。
+
+    v0.2.1 起采用“目标驱动收尾”：轮次只做提示，不再因为预算耗尽而收尾。
+    没有新证据时优先升级（换阶段 / 升级 final），只有确认 blocked 才允许结束。
+    """
     step = int(state.get("step") or 0) + 1
     decision, source = await decide(ctx, model, state)
     target = decision["next"]
-    # 连续两次同一阶段、证据指纹和摘要都高度相似，说明没有新进展；
-    # 继续派发只会重复消耗时间，直接收尾并保留现有证据。
+    escalations = int(state.get("escalations") or 0)
+    goal_done = has_flag(state) or not is_flag_mission(state)
+
+    def _escalate(reason: str) -> dict[str, Any]:
+        """换一条路线继续，而不是结束任务。"""
+        previous = str((state.get("worker_reports") or [{}])[-1].get("worker") or "")
+        candidates = ["final", "post_exploit", "exploit", "recon", "vuln_analysis"]
+        alt = next((name for name in candidates if name != previous), "final")
+        return {
+            "next": alt,
+            "task": (
+                f"上一轮 {previous or '上一阶段'} 没有产生新证据（{reason}）。"
+                "不要再重复相同动作：换一个入口/参数/协议，或改用另一种验证方式；"
+                "先说明当前卡点，再给出具体工具调用。"
+            ),
+            "reason": f"无进展升级（第 {escalations + 1} 次）：{reason}",
+            "summary": "",
+        }
+
+    # 1) 同一阶段连续两次没有新证据：升级路线，而不是收尾。
     if target != "finish" and _no_progress(state, target):
         ctx.audit.write(
             "commander_no_progress",
             worker=target,
             step=step,
-            previous_step=max(1, step - 1),
+            escalations=escalations,
         )
-        decision = {
-            "next": "finish",
-            "task": "",
-            "reason": f"连续两次 {target} 阶段没有产生新证据，停止重复派发",
-            "summary": "连续阶段无新证据，已保留现有发现并收尾。",
-        }
-        target = "finish"
-        source = "no-progress"
+        if escalations < MAX_ESCALATIONS:
+            decision = _escalate(f"连续两次 {target} 阶段没有产生新证据")
+            target = decision["next"]
+            source = "escalate"
+        else:
+            decision = {
+                "next": "finish",
+                "task": "",
+                "reason": f"已连续 {escalations} 次换路线仍无新证据，按 blocked 收尾",
+                "summary": "多次换路线后仍没有新证据，已保留现有发现并结束。",
+            }
+            target = "finish"
+            source = "blocked"
+
+    # 2) 因为软预算/步数想收尾：只要还没升级够，就不允许结束；硬熔断除外。
+    if (
+        target == "finish"
+        and source in {"no-progress", "limit"}
+        and escalations < MAX_ESCALATIONS
+    ):
+        decision = _escalate(decision.get("reason") or "预算或调度步数触顶")
+        target = decision["next"]
+        source = "escalate"
+
+    # 3) flag 类任务在没拿到 flag 时，模型主动收尾也要先升级一次。
+    if (
+        target == "finish"
+        and source == "model"
+        and is_flag_mission(state)
+        and not has_flag(state)
+        and escalations < MAX_ESCALATIONS
+        and state.get("worker_reports")
+    ):
+        decision = _escalate("目标要求 flag，但还没有任何 flag 证据")
+        target = decision["next"]
+        source = "escalate"
+
+    if source == "escalate":
+        escalations += 1
     label = WORKER_LABELS.get(target, "收尾")
     reason = decision.get("reason") or "按当前证据推进"
     task = decision.get("task") or ""
@@ -269,6 +361,7 @@ async def commander_node(
         task=task[:2000],
         reason=reason[:1000],
         source=source,
+        escalations=escalations,
     )
 
     entry = {
@@ -286,14 +379,26 @@ async def commander_node(
         "handoff": None,
         "step": step,
         "worker_rounds": 0,
+        "worker_tool_calls": 0,
+        "deepen_count": 0,
+        "loop_streak": 0,
+        "loop_hint": 0,
+        "stalled": False,
+        "escalations": escalations,
+        "loaded_skills": [],
+        "skill_conflicts": [],
         "commander_log": [*(state.get("commander_log") or []), entry],
     }
 
 
 __all__ = [
+    "MAX_ESCALATIONS",
     "commander_node",
     "decide",
     "fallback_decision",
+    "has_flag",
+    "is_flag_mission",
     "last_user_text",
+    "mission_objective",
     "parse_decision",
 ]
