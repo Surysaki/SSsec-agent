@@ -7,7 +7,7 @@
 
 Skill · 本地 JSON / JSONL 持久化
 
-![startup](C:\Users\lenovo\Desktop\0.3.0\docs\images\startup.png)
+![startup](D:\github_management\SSsec-agent\docs\images\startup.png)
 
 > **仅限授权测试。** 目标范围是技术提示与审计标记，不是法律授权。使用前请确认你已获得目标所有者的明确许可，并遵守测试窗口、方法与当地法律。
 
